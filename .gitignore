@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+*.env
+.env
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+
+# Application Output & User Data (IMPORTANT)
+# Prevents users from accidentally committing their results
+rnaseq_pipeline/
+deg_results/
+dromics_results/
+*.zip
+*.csv
+*.log
+*.out
+*.txt
+*.png
+*.bam
+*.sam
+*.sra
+*.fastq
+
+# Temp files created by the app
+*_fastq_temp/
