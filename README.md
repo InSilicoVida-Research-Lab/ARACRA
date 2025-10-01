@@ -25,7 +25,7 @@ This project uses Conda to manage its complex dependencies across Python, R, and
 
 1.  **Clone the Repository**
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
+    git clone https://github.com/InSilicoVida-Research-Lab/ARACRA.git
     cd your-repo-name
     ```
 
