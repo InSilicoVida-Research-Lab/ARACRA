@@ -1367,10 +1367,25 @@ identify_pca_outliers <- function(vst_data, metadata, pc_dims = 1:2, method = "c
 calculate_multiple_bmds <- function(fit_object) {{
   cat("\\n=== CALCULATING BMDs WITH MULTIPLE PARAMETERS ===\\n")
   
-  # Different z values for different sensitivity levels
-  z_values <- c({params.get('bmd_z_values', '0.1, 0.5, 1.0')})
-  x_values <- c({params.get('bmd_x_values', '10')})
+  # Robustly handle parameters from Python
+  z_vals_str <- "{params.get('bmd_z_values', '1.0')}"
+  x_vals_str <- "{params.get('bmd_x_values', '10')}"
   
+  z_values <- as.numeric(unlist(strsplit(z_vals_str, ",")))
+  if (length(z_values) == 0 || all(is.na(z_values))) {{
+    cat("Warning: Invalid z_values provided. Using default: 1.0\\n")
+    z_values <- c(1.0)
+  }}
+  
+  x_values <- as.numeric(unlist(strsplit(x_vals_str, ",")))
+  if (length(x_values) == 0 || all(is.na(x_values))) {{
+    cat("Warning: Invalid x_values provided. Using default: 10\\n")
+    x_values <- c(10)
+  }}
+
+  cat("Using z-values:", paste(z_values, collapse=", "), "\\n")
+  cat("Using x-values:", paste(x_values, collapse=", "), "\\n")
+
   bmd_results_list <- list()
   
   for (z in z_values) {{
@@ -1405,6 +1420,11 @@ select_best_bmd_params <- function(bmd_results_list) {{
   best_params <- NULL
   most_valid <- 0
   
+  if (length(bmd_results_list) == 0) {{
+      cat("Warning: No BMD results were generated. Cannot select best parameters.\\n")
+      return(NULL)
+  }}
+  
   for (param_name in names(bmd_results_list)) {{
     bmd_result <- bmd_results_list[[param_name]]
     valid_count <- sum(!is.na(bmd_result$res$BMD.zSD) & bmd_result$res$BMD.zSD > 0)
@@ -1421,7 +1441,7 @@ select_best_bmd_params <- function(bmd_results_list) {{
     cat(paste("\\nSelected best parameter set:", best_params, "with", most_valid, "valid BMDs\\n"))
     return(bmd_results_list[[best_params]])
   }} else {{
-    cat("No valid BMD results found. Using default parameters.\\n")
+    cat("Warning: No valid BMD results found across all parameter sets.\\n")
     return(NULL)
   }}
 }}
@@ -1603,7 +1623,11 @@ run_complete_dromics_pipeline <- function(counts_path, metadata_path, output_dir
   
   # Import and normalize in DRomics
   num_samples <- ncol(final_counts)
-  transformation_method <- if (num_samples < 30) "rlog" else "vst"
+  transformation_method <- if ("{params.get('transformation_method', 'auto')}" == "auto") {{
+    if (num_samples < 30) "rlog" else "vst"
+  }} else {{
+    "{params.get('transformation_method', 'auto')}"
+  }}
   cat("Using transformation method:", transformation_method, "for", num_samples, "samples\\n")
   
   o <- RNAseqdata(
@@ -1706,51 +1730,72 @@ run_complete_dromics_pipeline <- function(counts_path, metadata_path, output_dir
         # Select the best parameter set
         r_bmd <- select_best_bmd_params(bmd_results_multiple)
         
+        # Diagnostic block
+        cat("\\n--- PRE-BOOTSTRAP DIAGNOSTICS ---\\n")
+        cat("Value of 'bmd_bootstrap' parameter:", bmd_bootstrap, "\\n")
+        cat("Object 'r_bmd' is null:", is.null(r_bmd), "\\n")
+        if (!is.null(r_bmd)) {{
+            cat("Dimensions of r_bmd$res:", dim(r_bmd$res)[1], "rows,", dim(r_bmd$res)[2], "cols\\n")
+        }}
+        cat("-------------------------------------\\n")
+
         if (!is.null(r_bmd)) {{
           # Perform bootstrap if requested
           if (bmd_bootstrap) {{
-            cat("\\n=== BOOTSTRAP ANALYSIS FOR BMD CONFIDENCE INTERVALS ===\\n")
-            
-            # Determine number of iterations based on number of genes
-            n_iter <- ifelse(n_fitted > 1000, 500, 1000)
-            cat(paste("Performing bootstrap with", n_iter, "iterations for", n_fitted, "genes...\\n"))
-            
-            # Detect available cores
+            cat("\\n=== ROBUST BOOTSTRAP FOR BMD CONFIDENCE INTERVALS ===\\n")
+            n_iter <- {params.get('n_bootstrap', 500)}
             n_cores <- min(parallel::detectCores() - 1, 4)
+            cat(paste("Target iterations:", n_iter, "| Cores to use:", n_cores, "\\n"))
+
+            b_bmd <- NULL
             
+            # Try 'snow' backend first (more compatible, manual setup)
+            cat("\\n1. Attempting bootstrap with 'snow' parallel backend (manual setup)...\\n")
+            cl <- NULL
             tryCatch({{
-              b_bmd <- bmdboot(
-                r = r_bmd,
-                niter = n_iter,
-                progressbar = FALSE,
-                parallel = "snow",
-                ncpus = n_cores
-              )
+              cl <- parallel::makeCluster(n_cores)
+              cat("   - Cluster created successfully.\\n")
+              parallel::clusterEvalQ(cl, library(DRomics))
+              cat("   - DRomics library loaded on workers.\\n")
+              parallel::clusterExport(cl, varlist = "r_bmd", envir = environment())
+              cat("   - Fit object 'r_bmd' exported to workers.\\n")
+
+              b_bmd <- bmdboot(r = r_bmd, niter = n_iter, progressbar = FALSE, cl = cl)
+              cat("Bootstrap with 'snow' backend SUCCEEDED.\\n")
               
-              cat("Bootstrap complete!\\n")
-              
-              # Use bootstrap results for filtering
-              filtered_bmd_results <- bmdfilter(
-                res = b_bmd$res,
-                BMDfilter = "definedCI",
-                BMDtype = "zSD"
-              )
-            }}, error = function(e) {{
-              cat("Bootstrap failed:", e$message, "\\n")
-              cat("Using results without bootstrap confidence intervals\\n")
-              filtered_bmd_results <- bmdfilter(
-                res = r_bmd$res,
-                BMDfilter = "definedBMD",
-                BMDtype = "zSD"
-              )
+            }}, error = function(e_snow) {{
+              cat("-> Bootstrap with 'snow' backend FAILED. Reason:", e_snow$message, "\\n")
+            }}, finally = {{
+              if (!is.null(cl)) {{
+                parallel::stopCluster(cl)
+                cat("   - Cluster stopped.\\n")
+              }}
             }})
+            
+            # If both parallel methods failed, fall back to sequential
+            if (is.null(b_bmd)) {{
+              cat("\\n2. All parallel methods failed. Falling back to non-parallel bootstrap. This may be very slow...\\n")
+              tryCatch({{
+                b_bmd <- bmdboot(r = r_bmd, niter = n_iter, progressbar = TRUE, parallel = "no")
+                cat("Non-parallel bootstrap SUCCEEDED.\\n")
+              }}, error = function(e_seq) {{
+                cat("!!! CRITICAL: Non-parallel bootstrap also FAILED. Reason:", e_seq$message, "\\n")
+                cat("!!! Cannot calculate confidence intervals. Proceeding without bootstrap results.\\n")
+              }})
+            }}
+
+            # Filter results based on whether bootstrap succeeded
+            if (!is.null(b_bmd)) {{
+              filtered_bmd_results <- bmdfilter(res = b_bmd$res, BMDfilter = "definedCI", BMDtype = "zSD")
+            }} else {{
+              cat("WARNING: Proceeding with BMD values but without confidence intervals due to bootstrap failure.\\n")
+              filtered_bmd_results <- bmdfilter(res = r_bmd$res, BMDfilter = "definedBMD", BMDtype = "zSD")
+            }}
+            
           }} else {{
-            # Filter without bootstrap
-            filtered_bmd_results <- bmdfilter(
-              res = r_bmd$res,
-              BMDfilter = "definedBMD",
-              BMDtype = "zSD"
-            )
+            # Filter without bootstrap if not requested
+            cat("Bootstrap not requested. Filtering based on defined BMDs.\\n")
+            filtered_bmd_results <- bmdfilter(res = r_bmd$res, BMDfilter = "definedBMD", BMDtype = "zSD")
           }}
           
           cat(paste("After filtering:", nrow(filtered_bmd_results), "genes retained\\n"))
@@ -2093,7 +2138,6 @@ tryCatch({{
 }})
 """
     return r_script
-    
 def run_r_analysis(params, progress_callback=None):
     """Execute R analysis for DEG with live progress updates."""
     try:
@@ -2130,12 +2174,12 @@ def run_r_analysis(params, progress_callback=None):
         if process.returncode == 0:
             return True, "DEG analysis completed successfully.", log_lines
         else:
-            error_msg = stderr if stderr else "".join(log_lines)
-            return False, f"R script failed: {error_msg}", log_lines
+            # Combine stdout and stderr for a complete log on failure
+            full_log = "".join(log_lines) + "\n--- STDERR ---\n" + stderr
+            return False, f"R script failed with exit code {process.returncode}. See full log for details.", [full_log]
     
     except Exception as e:
         return False, str(e), []
-
 def run_dromics_analysis(params, progress_callback=None):
     """Execute R analysis for DRomics with live progress updates."""
     try:
@@ -2172,8 +2216,9 @@ def run_dromics_analysis(params, progress_callback=None):
         if process.returncode == 0:
             return True, "DRomics analysis completed successfully.", log_lines
         else:
-            error_msg = stderr if stderr else "".join(log_lines)
-            return False, f"R script failed: {error_msg}", log_lines
+            # Combine stdout and stderr for a complete log on failure
+            full_log = "".join(log_lines) + "\n--- STDERR ---\n" + stderr
+            return False, f"R script failed with exit code {process.returncode}. See full log for details.", [full_log]
     except Exception as e:
         return False, str(e), []
 
@@ -2292,7 +2337,26 @@ def get_json_metric(summary_dict, key, default=0):
     if isinstance(value, list) and value:
         return value[0]
     return value
-    
+def save_parameters_log(params: dict, filename: str = "analysis_parameters.json"):
+    """Saves the analysis parameters to a JSON file in the output directory."""
+    try:
+        output_dir = params.get('output_dir')
+        if not output_dir:
+            st.warning("Could not save parameters log: output directory not specified in params.")
+            return
+
+        # Ensure the directory exists, although it should have been created just before this call
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        log_path = os.path.join(output_dir, filename)
+        
+        with open(log_path, 'w') as f:
+            # We will convert Path objects or other non-serializable types to strings for logging
+            serializable_params = {k: str(v) for k, v in params.items()}
+            json.dump(serializable_params, f, indent=4)
+            
+    except Exception as e:
+        st.error(f"Failed to write parameters log to {log_path}: {e}")    
     
 def main():
     """Main application function with dose-response integration"""
@@ -2600,7 +2664,8 @@ def main():
                         else:
                             st.error(message)
                             if missing:
-                                st.code(f"# Install in R:\ninstall.packages(c({', '.join([f'\"{p}\"' for p in missing])}))")
+                                packages_str = ', '.join([f'"{p}"' for p in missing])
+                                st.code(f"# Install in R:\ninstall.packages(c({packages_str}))")
             
             with col1:
                 st.markdown("### Input Data")
@@ -2817,6 +2882,9 @@ def main():
                 
                 Path(deg_output_dir_val).mkdir(parents=True, exist_ok=True)
                 
+                # ADDED: Save parameters to a log file
+                save_parameters_log(params, filename="deg_parameters.json")
+                
                 with st.spinner("🧬 Running R-ODAF analysis... This may take several minutes"):
                     status_text = st.empty()
                     
@@ -2888,7 +2956,8 @@ def main():
                         else:
                             st.error(message)
                             if missing:
-                                st.code(f"# Install in R:\ninstall.packages(c({', '.join([f'\"{p}\"' for p in missing])}))")
+                                packages_str = ', '.join([f'"{p}"' for p in missing])
+                                st.code(f"# Install in R:\ninstall.packages(c({packages_str}))")
             
             with col1:
                 st.markdown("### Input Data")
@@ -3191,6 +3260,9 @@ def main():
                     params['transformation_method'] = transformation_method
                 
                 Path(dr_output_dir_val).mkdir(parents=True, exist_ok=True)
+
+                # ADDED: Save parameters to a log file
+                save_parameters_log(params, filename="dromics_parameters.json")
                 
                 with st.spinner("🧬 Running DRomics dose-response analysis with BMD... This may take several minutes"):
                     status_text = st.empty()
@@ -3517,9 +3589,16 @@ def main():
                                 st.markdown("**Missing packages:**")
                                 for pkg in missing:
                                     st.write(f"❌ {pkg}")
+                                
+                                cran_packages = [p for p in missing if p not in ["DESeq2", "edgeR", "org.Hs.eg.db", "DRomics"]]
+                                install_cran_str = ""
+                                if cran_packages:
+                                    packages_str = ', '.join([f'"{p}"' for p in cran_packages])
+                                    install_cran_str = f"install.packages(c({packages_str}))"
+
                                 st.code(f"""
 # Install missing packages in R:
-install.packages(c({', '.join([f'"{p}"' for p in missing if p not in ["DESeq2", "edgeR", "org.Hs.eg.db", "DRomics"]])}))
+{install_cran_str}
 
 # For Bioconductor packages:
 if (!require("BiocManager", quietly = TRUE))
@@ -3528,7 +3607,7 @@ BiocManager::install(c("DESeq2", "edgeR", "org.Hs.eg.db"))
 
 # For DRomics (if missing):
 # install.packages("DRomics")
-                                """)
+""")
             
             st.markdown("### About")
             st.info("""
@@ -3556,4 +3635,3 @@ BiocManager::install(c("DESeq2", "edgeR", "org.Hs.eg.db"))
 # This block is needed to run the app
 if __name__ == "__main__":
     main()
-
