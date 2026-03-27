@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  ARACRA-STAR Pipeline — run_app.sh
-#  Launches Streamlit app with rnaseq_pipeline conda env
+#  Launches Streamlit app with test_ARCRA conda env
 # =============================================================================
 set -euo pipefail
 
@@ -10,7 +10,7 @@ PORT="${1:-8502}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║       ARACRA-STAR — Launching App                       ║"
+echo "║       ARACRA— Launching App                       ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
 # Try to detect conda
