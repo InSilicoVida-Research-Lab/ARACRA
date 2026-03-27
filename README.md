@@ -889,6 +889,7 @@ If that doesn't resolve it, run setup with `--skip-index` to at least get the re
 - Check the live log first (`~/aracra_star_work/pipeline.log`) — it usually contains the exact error
 - Use the **▶ Check Tools** button in the sidebar to confirm all tools are installed
 - For Nextflow-specific issues: the Nextflow log is at `.nextflow.log` in the ARACRA directory
+- For any issue, create a ticket in issues section of GitHub.
 
 ---
 
