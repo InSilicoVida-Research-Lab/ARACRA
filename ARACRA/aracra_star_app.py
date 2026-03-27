@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-ARACRA Pipeline — Streamlit App (v2)
+ARACRA Pipeline — Streamlit App 
 Two-phase design:
   Phase 1: SRA → fastp → STAR/HISAT2 → QC → featureCounts/Salmon → MultiQC
   Phase 2: (after user reviews QC) → DESeq2 → DRomics/BMD
 
-Key change from v1: preprocessing and analysis are decoupled.
+preprocessing and analysis are decoupled.
 After Phase 1, the user sees QC outlier results and chooses which samples
-to exclude BEFORE analysis runs. No more silent auto-exclusion.
+to exclude BEFORE analysis runs. 
 """
 
 import streamlit as st
