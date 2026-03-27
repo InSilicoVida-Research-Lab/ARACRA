@@ -28,7 +28,7 @@ params.exclude_samples  = ""
 params.cleanup_work     = false
 params.run_qc_only      = false
 
-// ── NTP 2018 / EFSA Quality Filters ──
+// ── BMD Quality Filters ──
 params.bmdu_bmdl_ratio     = 40.0
 params.bmd_max_dose_filter = true
 params.bmd_extrap_factor   = 10.0
