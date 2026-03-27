@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  ARACRA-STAR Pipeline — setup.sh (v3)
+#  ARACRA Pipeline — setup.sh 
 #  Auto-discovers system resources, builds conda env, downloads references,
 #  configures everything. Warns if RAM < 32GB (recommends HISAT2 over STAR).
 # =============================================================================
@@ -32,7 +32,7 @@ done
 
 echo -e "${BOLD}"
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║     ARACRA-STAR Pipeline — Setup  (v3)                  ║"
+echo "║     ARACRA Pipeline — Setup                 ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
