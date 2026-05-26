@@ -13,19 +13,72 @@ ok()   { echo -e "${GREEN}[  OK ]${NC} $*"; }
 warn() { echo -e "${YELLOW}[ WARN]${NC} $*"; }
 fail() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# ── Error trap ────────────────────────────────────────────────────────────────
+# With `set -e`, any unhandled failure aborts the script. This trap makes the
+# abort informative: it reports the line number and the command that failed.
+# Steps that are allowed to fail must handle it explicitly (|| warn ...).
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    echo -e "${RED}[ERROR]${NC} Setup failed at line ${line_no} (exit ${exit_code})." >&2
+    echo -e "${RED}[ERROR]${NC} Failing command: ${BASH_COMMAND}" >&2
+    echo -e "${RED}[ERROR]${NC} Fix the issue above and re-run — completed steps will be skipped." >&2
+    exit "$exit_code"
+}
+trap 'on_error ${LINENO}' ERR
+
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Download helper: fetch a URL, then verify the result is real ──────────────
+# Guards against the silent-corruption failure mode: wget can "succeed" (exit 0)
+# while returning a truncated file or an HTML error page. After download we
+# verify the file exists and exceeds a minimum plausible size (bytes).
+# Usage: fetch_verified <url> <output_path> <min_bytes> [description]
+fetch_verified() {
+    local url="$1" out="$2" min_bytes="$3" desc="${4:-file}"
+    local tmp="${out}.partial"
+    rm -f "$tmp"
+    if ! wget -q --show-progress --tries=3 --timeout=120 -O "$tmp" "$url"; then
+        rm -f "$tmp"
+        fail "Download failed (${desc}): ${url}"
+    fi
+    local size
+    size=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
+    if [ "$size" -lt "$min_bytes" ]; then
+        rm -f "$tmp"
+        fail "Downloaded ${desc} is only ${size} bytes (expected >= ${min_bytes}) — likely an error page, not real data: ${url}"
+    fi
+    mv "$tmp" "$out"
+}
+
+# ── Gzip integrity check ──────────────────────────────────────────────────────
+# Verifies a .gz file is a valid, complete gzip archive before it is used.
+verify_gzip() {
+    local f="$1" desc="${2:-archive}"
+    gzip -t "$f" 2>/dev/null || fail "Corrupt or incomplete gzip (${desc}): ${f}"
+}
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
 SKIP_INDEX=false
-SKIP_SCREEN=false
+# FastQ Screen genome builds are opt-in: ~2.5 GB of FASTA downloads plus
+# multi-hour bowtie2 index builds for human/mouse/rat. A plain `bash setup.sh`
+# skips it; `bash setup.sh --with-screen` runs it as part of the same command.
+WITH_SCREEN=false
 DB_DIR="${HOME}/databases"
 for arg in "$@"; do
     case "$arg" in
         --skip-index)    SKIP_INDEX=true ;;
-        --skip-screen)   SKIP_SCREEN=true ;;
+        --with-screen)   WITH_SCREEN=true ;;
+        --skip-screen)   WITH_SCREEN=false ;;   # alias of the default; kept for compatibility
         --db-dir=*)      DB_DIR="${arg#*=}" ;;
         --help|-h)
-            echo "Usage: bash setup.sh [--skip-index] [--skip-screen] [--db-dir=PATH]"
+            echo "Usage: bash setup.sh [--skip-index] [--with-screen] [--db-dir=PATH]"
+            echo ""
+            echo "  --skip-index    Skip building STAR/HISAT2/Salmon indexes"
+            echo "  --with-screen   Also download FASTA and build FastQ Screen bowtie2"
+            echo "                  indexes (Human, Mouse, Rat, E.coli, PhiX, Adapters,"
+            echo "                  Vectors). Adds several hours — runs in the same command."
+            echo "  --db-dir=PATH   Database directory (default: \${HOME}/databases)"
             exit 0 ;;
     esac
 done
@@ -137,7 +190,7 @@ ok "Active env: ${ENV_PATH}"
 log "Installing pipeline tools (this may take a few minutes)..."
 mamba install -p "$ENV_PATH" -c conda-forge -c bioconda -y -q \
     openjdk=17 \
-    nextflow \
+    'nextflow>=24.04,<25' \
     python=3.12 \
     openpyxl \
     sra-tools \
@@ -194,46 +247,83 @@ cat("R packages OK\n")
 ' 2>/dev/null || warn "DRomics install had issues — check manually"
 ok "R packages done"
 
-# ── Install rtracklayer (requires source patch for GCC 15 compatibility) ──
-# GCC 15 treats empty parentheses () as zero arguments (C23 behaviour).
-# The UCSC source in rtracklayer uses a function pointer named 'free' with
-# signature void(*free)() which GCC 15 rejects. We patch the source before
-# compiling to fix the signature to void(*free)(void*).
-log "Installing rtracklayer (applying GCC 15 source patch)..."
-if ! "${ENV_PATH}/bin/Rscript" -e 'requireNamespace("rtracklayer", quietly=TRUE)' 2>/dev/null | grep -q TRUE; then
-    RTRACKLAYER_TMP="/tmp/rtracklayer_build_$$"
-    mkdir -p "$RTRACKLAYER_TMP"
-
-    # Get the correct version for the installed Bioconductor
-    BIOC_VER=$("${ENV_PATH}/bin/Rscript" -e 'cat(as.character(BiocManager::version()))' 2>/dev/null)
-    RT_URL="https://bioconductor.org/packages/${BIOC_VER}/bioc/src/contrib/rtracklayer_1.66.0.tar.gz"
-
-    log "  Downloading rtracklayer source..."
-    curl -L -o "${RTRACKLAYER_TMP}/rtracklayer.tar.gz" "$RT_URL" \
-        || fail "Failed to download rtracklayer source"
-
-    tar xzf "${RTRACKLAYER_TMP}/rtracklayer.tar.gz" -C "$RTRACKLAYER_TMP"
-
-    log "  Patching for GCC 15 (void(*free)() → void(*free)(void*))..."
-    # Rename parameter 'free' to 'freeEl' to avoid collision with stdlib macro
-    sed -i \
-        's/void (\*free)()/void (*freeEl)(void*)/g;
-         s/else if (free != NULL)/else if (freeEl != NULL)/g;
-         s/\bfree(el)\b/freeEl(el)/g' \
-        "${RTRACKLAYER_TMP}/rtracklayer/src/ucsc/common.c"
-
-    # Also fix the header declaration
-    sed -i 's/void (\*free)()/void (*free)(void*)/g' \
-        "${RTRACKLAYER_TMP}/rtracklayer/src/ucsc/common.h"
-
-    log "  Compiling and installing rtracklayer..."
-    "${ENV_PATH}/bin/R" CMD INSTALL "${RTRACKLAYER_TMP}/rtracklayer/" \
-        || fail "rtracklayer installation failed — see output above"
-
-    rm -rf "$RTRACKLAYER_TMP"
-    ok "rtracklayer installed (GCC 15 patched)"
-else
+# ── Install rtracklayer ──
+# Strategy: prefer the prebuilt bioconda package (works on linux-64 and
+# linux-aarch64 — the binary is already compiled). If that is unavailable,
+# build from source.
+#
+# GCC 15 defaults to the C23 standard, where an empty parameter list '()'
+# means "zero arguments" instead of "unspecified". The bundled UCSC source
+# in rtracklayer declares function pointers like 'void (*free)()', which
+# C23 then rejects. Rather than text-patching the source (fragile — the
+# exact spelling changes between package versions), we compile this one
+# package under the older gnu17 standard via a temporary ~/.R/Makevars.
+# This requires no source edits at all and is version-independent.
+log "Installing rtracklayer..."
+if "${ENV_PATH}/bin/Rscript" -e 'requireNamespace("rtracklayer", quietly=TRUE)' 2>/dev/null | grep -q TRUE; then
     ok "rtracklayer already installed"
+else
+    # --- Attempt 1: prebuilt bioconda binary (no compilation needed) ---
+    log "  Trying prebuilt bioconda package..."
+    if mamba install -y -q -p "$ENV_PATH" -c bioconda -c conda-forge \
+        bioconductor-rtracklayer >/dev/null 2>&1 \
+        && "${ENV_PATH}/bin/Rscript" -e 'requireNamespace("rtracklayer", quietly=TRUE)' \
+            2>/dev/null | grep -q TRUE; then
+        ok "rtracklayer installed (prebuilt bioconda binary)"
+    else
+        # --- Attempt 2: source build under the gnu17 C standard ---
+        log "  Prebuilt package unavailable — building from source (gnu17 standard)..."
+
+        # Temporarily inject -std=gnu17 via ~/.R/Makevars so R CMD INSTALL
+        # compiles all C sources for this package under pre-C23 rules.
+        # Back up any existing Makevars and restore it afterwards.
+        MAKEVARS_DIR="${HOME}/.R"
+        MAKEVARS_FILE="${MAKEVARS_DIR}/Makevars"
+        MAKEVARS_BAK=""
+        mkdir -p "$MAKEVARS_DIR"
+        if [ -f "$MAKEVARS_FILE" ]; then
+            MAKEVARS_BAK="${MAKEVARS_FILE}.aracra_bak_$$"
+            cp "$MAKEVARS_FILE" "$MAKEVARS_BAK"
+        fi
+        # CFLAGS covers .c sources; the *_STD vars are honoured by newer R toolchains.
+        cat >> "$MAKEVARS_FILE" <<'MAKEVARS_EOF'
+CFLAGS += -std=gnu17
+C_STD = gnu17
+CXXSTD = gnu++17
+MAKEVARS_EOF
+
+        # restore_makevars: undo our temporary Makevars change on any exit path
+        restore_makevars() {
+            if [ -n "$MAKEVARS_BAK" ]; then
+                mv "$MAKEVARS_BAK" "$MAKEVARS_FILE"
+            else
+                rm -f "$MAKEVARS_FILE"
+            fi
+        }
+
+        # Run the installer. BiocManager resolves the correct version for the
+        # installed Bioconductor release itself. Note: we deliberately do NOT
+        # use the installer's exit code to decide success — post-install steps
+        # (vignette building, HTML index updates) can yield a nonzero status
+        # even when the package itself installed fine ("* DONE"). The only
+        # reliable test is whether the package can actually be loaded.
+        log "  Compiling and installing rtracklayer (this may take a few minutes)..."
+        "${ENV_PATH}/bin/Rscript" -e \
+            'BiocManager::install("rtracklayer", update=FALSE, ask=FALSE)' || true
+
+        # Restore the user's Makevars BEFORE verifying, so the check runs in a
+        # clean environment unaffected by our temporary compiler flags.
+        restore_makevars
+
+        # Sole arbiter of success: can rtracklayer be loaded?
+        if "${ENV_PATH}/bin/Rscript" -e \
+                'if (requireNamespace("rtracklayer", quietly=TRUE)) cat("RTOK")' \
+                2>/dev/null | grep -q RTOK; then
+            ok "rtracklayer installed (built from source, gnu17 standard)"
+        else
+            fail "rtracklayer installation failed — see output above"
+        fi
+    fi
 fi
 
 # ── Verify tools ──
@@ -265,11 +355,14 @@ mkdir -p "$REF_DIR" "$ANN_DIR" "$SCREEN_DIR"
 
 # ── GTF ──
 GTF_FILE="${REF_DIR}/gencode.v44.primary_assembly.annotation.gtf"
-if [ ! -f "$GTF_FILE" ]; then
+if [ ! -f "$GTF_FILE" ] || [ ! -s "$GTF_FILE" ]; then
     log "Downloading GTF annotation (~50 MB)..."
-    wget -q --show-progress -O "${GTF_FILE}.gz" \
-        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.primary_assembly.annotation.gtf.gz"
-    gunzip "${GTF_FILE}.gz"
+    fetch_verified \
+        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.primary_assembly.annotation.gtf.gz" \
+        "${GTF_FILE}.gz" 10000000 "GTF annotation"
+    verify_gzip "${GTF_FILE}.gz" "GTF annotation"
+    gunzip -f "${GTF_FILE}.gz"
+    [ -s "$GTF_FILE" ] || fail "GTF is empty after extraction: ${GTF_FILE}"
     ok "GTF: ${GTF_FILE}"
 else
     ok "GTF exists: ${GTF_FILE}"
@@ -277,11 +370,14 @@ fi
 
 # ── Genome FASTA ──
 GENOME_FA="${REF_DIR}/GRCh38.primary_assembly.genome.fa"
-if [ ! -f "$GENOME_FA" ]; then
+if [ ! -f "$GENOME_FA" ] || [ ! -s "$GENOME_FA" ]; then
     log "Downloading genome FASTA (~900 MB)..."
-    wget -q --show-progress -O "${GENOME_FA}.gz" \
-        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/GRCh38.primary_assembly.genome.fa.gz"
-    gunzip "${GENOME_FA}.gz"
+    fetch_verified \
+        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/GRCh38.primary_assembly.genome.fa.gz" \
+        "${GENOME_FA}.gz" 500000000 "genome FASTA"
+    verify_gzip "${GENOME_FA}.gz" "genome FASTA"
+    gunzip -f "${GENOME_FA}.gz"
+    [ -s "$GENOME_FA" ] || fail "Genome FASTA is empty after extraction: ${GENOME_FA}"
     ok "Genome: ${GENOME_FA}"
 else
     ok "Genome exists: ${GENOME_FA}"
@@ -289,19 +385,29 @@ fi
 
 # ── Transcriptome FASTA (for Salmon) ──
 TRANSCRIPTOME_FA="${REF_DIR}/gencode.v44.transcripts.fa"
-if [ ! -f "$TRANSCRIPTOME_FA" ]; then
+if [ ! -f "$TRANSCRIPTOME_FA" ] || [ ! -s "$TRANSCRIPTOME_FA" ]; then
     log "Downloading transcriptome FASTA (~300 MB)..."
-    wget -q --show-progress -O "${TRANSCRIPTOME_FA}.gz" \
-        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.transcripts.fa.gz"
-    gunzip "${TRANSCRIPTOME_FA}.gz"
+    fetch_verified \
+        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.transcripts.fa.gz" \
+        "${TRANSCRIPTOME_FA}.gz" 30000000 "transcriptome FASTA"
+    verify_gzip "${TRANSCRIPTOME_FA}.gz" "transcriptome FASTA"
+    gunzip -f "${TRANSCRIPTOME_FA}.gz"
+    [ -s "$TRANSCRIPTOME_FA" ] || fail "Transcriptome FASTA is empty after extraction: ${TRANSCRIPTOME_FA}"
     ok "Transcriptome: ${TRANSCRIPTOME_FA}"
 else
     ok "Transcriptome exists"
 fi
 
 # ── STAR Index ──
+# Validity check: a complete STAR index always contains 'SAindex'. A bare
+# directory (e.g. from a crashed build) is treated as invalid and rebuilt.
 STAR_INDEX_DIR="${REF_DIR}/star_index_hg38"
-if [ "$SKIP_INDEX" = false ] && [ ! -d "$STAR_INDEX_DIR" ] && [ "$TOTAL_RAM_INT" -ge 32 ]; then
+star_index_valid() { [ -s "${STAR_INDEX_DIR}/SAindex" ] && [ -s "${STAR_INDEX_DIR}/Genome" ]; }
+if [ "$SKIP_INDEX" = false ] && ! star_index_valid && [ "$TOTAL_RAM_INT" -ge 32 ]; then
+    if [ -d "$STAR_INDEX_DIR" ]; then
+        warn "STAR index directory exists but is incomplete — rebuilding from scratch"
+        rm -rf "$STAR_INDEX_DIR"
+    fi
     log "Building STAR index (needs ~32 GB RAM, ~30-45 min)..."
     mkdir -p "$STAR_INDEX_DIR"
     STAR --runMode genomeGenerate \
@@ -310,33 +416,56 @@ if [ "$SKIP_INDEX" = false ] && [ ! -d "$STAR_INDEX_DIR" ] && [ "$TOTAL_RAM_INT"
          --sjdbGTFfile "$GTF_FILE" \
          --runThreadN "$CPU_CORES" \
          --sjdbOverhang 100
+    star_index_valid || fail "STAR index build finished but index is incomplete: ${STAR_INDEX_DIR}"
     ok "STAR index: ${STAR_INDEX_DIR}"
-elif [ "$TOTAL_RAM_INT" -lt 32 ] && [ ! -d "$STAR_INDEX_DIR" ]; then
+elif [ "$TOTAL_RAM_INT" -lt 32 ] && ! star_index_valid; then
     warn "Skipping STAR index build — insufficient RAM (${TOTAL_RAM_GB} GB < 32 GB)"
     warn "Use HISAT2 for alignment, or build STAR index on a machine with 32+ GB RAM"
     STAR_INDEX_DIR=""
 else
-    ok "STAR index exists: ${STAR_INDEX_DIR}"
+    ok "STAR index exists and is valid: ${STAR_INDEX_DIR}"
 fi
 
 # ── HISAT2 Index ──
+# Validity check: the pre-built grch38_tran index ships 8 .ht2 files; the
+# last one ('.8.ht2') is the sentinel for a complete extraction.
 HISAT2_INDEX_DIR="${REF_DIR}/hisat2_index_hg38"
 HISAT2_INDEX_PREFIX="${HISAT2_INDEX_DIR}/genome_tran"
-if [ "$SKIP_INDEX" = false ] && [ ! -f "${HISAT2_INDEX_PREFIX}.1.ht2" ]; then
+hisat2_index_valid() { [ -s "${HISAT2_INDEX_PREFIX}.1.ht2" ] && [ -s "${HISAT2_INDEX_PREFIX}.8.ht2" ]; }
+if [ "$SKIP_INDEX" = false ] && ! hisat2_index_valid; then
+    if [ -d "$HISAT2_INDEX_DIR" ]; then
+        warn "HISAT2 index directory exists but is incomplete — re-downloading"
+        rm -rf "$HISAT2_INDEX_DIR"
+    fi
     log "Downloading HISAT2 pre-built index (~4 GB, ~10-30 min)..."
     mkdir -p "$HISAT2_INDEX_DIR"
-    wget -q --show-progress -O "${REF_DIR}/grch38_tran.tar.gz" \
-        "https://genome-idx.s3.amazonaws.com/hisat/grch38_tran.tar.gz"
+    fetch_verified \
+        "https://genome-idx.s3.amazonaws.com/hisat/grch38_tran.tar.gz" \
+        "${REF_DIR}/grch38_tran.tar.gz" 3000000000 "HISAT2 index archive"
+    verify_gzip "${REF_DIR}/grch38_tran.tar.gz" "HISAT2 index archive"
     tar -xzf "${REF_DIR}/grch38_tran.tar.gz" -C "$HISAT2_INDEX_DIR" --strip-components=1
     rm -f "${REF_DIR}/grch38_tran.tar.gz"
+    hisat2_index_valid || fail "HISAT2 index extracted but is incomplete: ${HISAT2_INDEX_PREFIX}"
     ok "HISAT2 index: ${HISAT2_INDEX_PREFIX}"
 else
-    ok "HISAT2 index exists: ${HISAT2_INDEX_PREFIX}"
+    ok "HISAT2 index exists and is valid: ${HISAT2_INDEX_PREFIX}"
 fi
 
 # ── Salmon Index (with genome decoy for better mapping rates) ──
+# Validity check: 'info.json' is written at the end of every successful build
+# (all salmon versions). The second sentinel is format-dependent: salmon >=1.11
+# uses the SSHash index format ('sshash.bin'); older salmon used the dense
+# pufferfish format ('pos.bin'). Accept either so the check is version-robust.
 SALMON_INDEX_DIR="${REF_DIR}/salmon_index_hg38"
-if [ "$SKIP_INDEX" = false ] && [ ! -d "$SALMON_INDEX_DIR" ]; then
+salmon_index_valid() {
+    [ -s "${SALMON_INDEX_DIR}/info.json" ] || return 1
+    [ -s "${SALMON_INDEX_DIR}/sshash.bin" ] || [ -s "${SALMON_INDEX_DIR}/pos.bin" ]
+}
+if [ "$SKIP_INDEX" = false ] && ! salmon_index_valid; then
+    if [ -d "$SALMON_INDEX_DIR" ]; then
+        warn "Salmon index directory exists but is incomplete — rebuilding from scratch"
+        rm -rf "$SALMON_INDEX_DIR"
+    fi
     # Verify salmon works before attempting index build
     if ! salmon --version &>/dev/null; then
         warn "Salmon is not functional (possible GLIBC incompatibility)"
@@ -352,17 +481,21 @@ if [ "$SKIP_INDEX" = false ] && [ ! -d "$SALMON_INDEX_DIR" ]; then
         cat "$TRANSCRIPTOME_FA" "$GENOME_FA" > "$GENTROME"
         grep "^>" "$GENOME_FA" | sed 's/>//' | cut -d' ' -f1 > "$DECOYS"
 
-        if salmon index -t "$GENTROME" -d "$DECOYS" \
-            -i "$SALMON_INDEX_DIR" --threads "$CPU_CORES" --gencode; then
+        # salmon index is allowed to fail without aborting the whole script;
+        # temporarily lift the ERR trap for this one explicitly-handled command.
+        salmon_rc=0
+        salmon index -t "$GENTROME" -d "$DECOYS" \
+            -i "$SALMON_INDEX_DIR" --threads "$CPU_CORES" --gencode || salmon_rc=$?
+        if [ "$salmon_rc" -eq 0 ] && salmon_index_valid; then
             ok "Salmon index (with decoys): ${SALMON_INDEX_DIR}"
         else
-            warn "Salmon index build failed — salmon quantification will not be available"
+            warn "Salmon index build failed or incomplete — salmon quantification will not be available"
             rm -rf "$SALMON_INDEX_DIR"
         fi
-        rm -f "$GENTROME"
+        rm -f "$GENTROME" "$DECOYS"
     fi
 else
-    ok "Salmon index exists: ${SALMON_INDEX_DIR}"
+    ok "Salmon index exists and is valid: ${SALMON_INDEX_DIR}"
 fi
 
 # ── Annotation files ──
@@ -468,24 +601,182 @@ else
     ok "refFlat exists"
 fi
 
-# ── FastQ Screen genomes ──
-SCREEN_CONF="${SCREEN_DIR}/FastQ_Screen_Genomes/fastq_screen.conf"
-if [ "$SKIP_SCREEN" = false ] && [ ! -f "$SCREEN_CONF" ]; then
-    if command -v fastq_screen &>/dev/null; then
-        log "Downloading FastQ Screen genomes (~30-60 min, ~30 GB)..."
-        log "  This downloads bowtie2 indices for Human, Mouse, Rat, E.coli, etc."
-        log "  Run with --skip-screen to skip this step and add genomes later."
-        fastq_screen --get_genomes --outdir "$SCREEN_DIR" \
-            || warn "FastQ Screen genome download failed — contamination check will be skipped"
-    else
-        warn "fastq_screen not found in PATH — skipping genome download"
-        warn "  Install: conda install -c bioconda fastq-screen"
-        warn "  Then re-run setup.sh, or run: fastq_screen --get_genomes --outdir ${SCREEN_DIR}"
-    fi
-elif [ "$SKIP_SCREEN" = true ]; then
-    ok "FastQ Screen skipped (--skip-screen)"
+# ── FastQ Screen genomes (opt-in: --with-screen) ──
+# `fastq_screen --get_genomes` is broken in v0.16.0 (the current bioconda
+# release): an HTTP->HTTPS redirect drops a path slash, producing an
+# unresolvable host. Instead of relying on it, we build the screen panel
+# ourselves: download genome FASTA from stable infrastructure hosts (Ensembl,
+# NCBI), build bowtie2 indexes locally, and generate fastq_screen.conf.
+#
+# Each genome is built independently and validity-checked, so an interrupted
+# run resumes where it left off rather than rebuilding everything.
+SCREEN_GENOMES_DIR="${SCREEN_DIR}/FastQ_Screen_Genomes"
+SCREEN_CONF="${SCREEN_GENOMES_DIR}/fastq_screen.conf"
+# The panel is complete only when the conf lists all 7 expected genomes.
+# Checking merely "exists with >=1 DATABASE line" would let a stale partial
+# conf from an interrupted run masquerade as a finished panel — so we count.
+SCREEN_EXPECTED_GENOMES=7
+screen_conf_valid() {
+    [ -s "$SCREEN_CONF" ] || return 1
+    local n
+    n=$(grep -c '^DATABASE' "$SCREEN_CONF" 2>/dev/null || echo 0)
+    [ "$n" -ge "$SCREEN_EXPECTED_GENOMES" ]
+}
+
+if [ "$WITH_SCREEN" = false ]; then
+    ok "FastQ Screen skipped (run with --with-screen to build the genome panel)"
+elif screen_conf_valid; then
+    ok "FastQ Screen genomes already built: ${SCREEN_GENOMES_DIR}"
 else
-    ok "FastQ Screen genomes exist"
+    log "Building FastQ Screen genome panel (--with-screen)..."
+    log "  Downloads ~2.5 GB of FASTA and builds bowtie2 indexes."
+    log "  Mammalian index builds are slow — expect several hours total."
+
+    # A bowtie2 index is complete when both the forward '.1.bt2' and the
+    # reverse '.rev.1.bt2' files exist and are non-empty.
+    bt2_index_valid() {
+        local prefix="$1"
+        { [ -s "${prefix}.1.bt2" ] && [ -s "${prefix}.rev.1.bt2" ]; } || \
+        { [ -s "${prefix}.1.bt2l" ] && [ -s "${prefix}.rev.1.bt2l" ]; }
+    }
+
+    # build_screen_genome <name> <fasta_url> <min_bytes> <gzipped:true|false>
+    # Downloads FASTA into a per-genome dir, builds the bowtie2 index, and
+    # leaves a clean prefix at <SCREEN_GENOMES_DIR>/<name>/<name>. Each genome
+    # failure is non-fatal: a warn is emitted and the genome is left out of
+    # the conf, so one bad download doesn't abort the whole panel.
+    build_screen_genome() {
+        local name="$1" url="$2" min_bytes="$3" gzipped="$4"
+        local gdir="${SCREEN_GENOMES_DIR}/${name}"
+        local prefix="${gdir}/${name}"
+        local fasta="${gdir}/${name}.fa"
+
+        if bt2_index_valid "$prefix"; then
+            ok "  ${name}: bowtie2 index already built"
+            return 0
+        fi
+        mkdir -p "$gdir"
+        log "  ${name}: downloading FASTA..."
+
+        local rc=0
+        if [ "$gzipped" = "true" ]; then
+            wget -q --show-progress --tries=3 --timeout=180 \
+                -O "${fasta}.gz" "$url" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                warn "  ${name}: download failed — skipping this genome"; rm -f "${fasta}.gz"; return 1
+            fi
+            local size; size=$(stat -c%s "${fasta}.gz" 2>/dev/null || echo 0)
+            if [ "$size" -lt "$min_bytes" ]; then
+                warn "  ${name}: download too small (${size} B) — skipping"; rm -f "${fasta}.gz"; return 1
+            fi
+            gzip -t "${fasta}.gz" 2>/dev/null || { warn "  ${name}: corrupt gzip — skipping"; rm -f "${fasta}.gz"; return 1; }
+            gunzip -f "${fasta}.gz"
+        else
+            wget -q --show-progress --tries=3 --timeout=180 \
+                -O "$fasta" "$url" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                warn "  ${name}: download failed — skipping this genome"; rm -f "$fasta"; return 1
+            fi
+            local size; size=$(stat -c%s "$fasta" 2>/dev/null || echo 0)
+            if [ "$size" -lt "$min_bytes" ]; then
+                warn "  ${name}: download too small (${size} B) — skipping"; rm -f "$fasta"; return 1
+            fi
+        fi
+        [ -s "$fasta" ] || { warn "  ${name}: FASTA empty after extraction — skipping"; return 1; }
+
+        log "  ${name}: building bowtie2 index (${CPU_CORES} threads)..."
+        if bowtie2-build --threads "$CPU_CORES" "$fasta" "$prefix" >/dev/null 2>&1 \
+           && bt2_index_valid "$prefix"; then
+            rm -f "$fasta"   # FASTA no longer needed once the index exists
+            ok "  ${name}: bowtie2 index built"
+            return 0
+        else
+            warn "  ${name}: bowtie2-build failed — skipping this genome"
+            return 1
+        fi
+    }
+
+    mkdir -p "$SCREEN_GENOMES_DIR"
+
+    # Adapters: short, well-known Illumina sequences — written directly,
+    # no download needed. bowtie2 needs them as a FASTA to index.
+    ADAPTERS_DIR="${SCREEN_GENOMES_DIR}/Adapters"
+    ADAPTERS_FA="${ADAPTERS_DIR}/Adapters.fa"
+    if ! bt2_index_valid "${ADAPTERS_DIR}/Adapters"; then
+        mkdir -p "$ADAPTERS_DIR"
+        cat > "$ADAPTERS_FA" << 'ADAPTEREOF'
+>Illumina_Universal_Adapter
+AGATCGGAAGAG
+>Illumina_TruSeq_Adapter_Read1
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+>Illumina_TruSeq_Adapter_Read2
+AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+>Nextera_Transposase_Adapter
+CTGTCTCTTATACACATCT
+>Illumina_Small_RNA_3p_Adapter
+TGGAATTCTCGGGTGCCAAGG
+>Illumina_Small_RNA_5p_Adapter
+GTTCAGAGTTCTACAGTCCGACGATC
+>PolyA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+>PolyG
+GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG
+ADAPTEREOF
+        log "  Adapters: building bowtie2 index..."
+        if bowtie2-build --threads "$CPU_CORES" "$ADAPTERS_FA" \
+                "${ADAPTERS_DIR}/Adapters" >/dev/null 2>&1; then
+            ok "  Adapters: bowtie2 index built"
+        else
+            warn "  Adapters: bowtie2-build failed — skipping"
+        fi
+    else
+        ok "  Adapters: bowtie2 index already built"
+    fi
+
+    # Genomes: each call is independently resumable and non-fatal on failure.
+    # min_bytes is a conservative floor to catch error pages / truncation.
+    build_screen_genome "Human" \
+        "https://ftp.ensembl.org/pub/release-111/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz" \
+        500000000 true || true
+    build_screen_genome "Mouse" \
+        "https://ftp.ensembl.org/pub/release-111/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz" \
+        500000000 true || true
+    build_screen_genome "Rat" \
+        "https://ftp.ensembl.org/pub/release-111/fasta/rattus_norvegicus/dna/Rattus_norvegicus.mRatBN7.2.dna.toplevel.fa.gz" \
+        500000000 true || true
+    build_screen_genome "Ecoli" \
+        "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz" \
+        500000 true || true
+    build_screen_genome "PhiX" \
+        "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/819/615/GCF_000819615.1_ViralProj14015/GCF_000819615.1_ViralProj14015_genomic.fna.gz" \
+        1000 true || true
+    build_screen_genome "Vectors" \
+        "https://ftp.ncbi.nlm.nih.gov/pub/UniVec/UniVec" \
+        100000 false || true
+
+    # Generate fastq_screen.conf from whatever genomes built successfully.
+    log "  Writing fastq_screen.conf..."
+    {
+        echo "# FastQ Screen configuration — auto-generated by ARACRA setup.sh"
+        echo "# $(date)"
+        echo ""
+        echo "THREADS	${CPU_CORES}"
+        echo ""
+        for g in Human Mouse Rat Ecoli PhiX Vectors Adapters; do
+            prefix="${SCREEN_GENOMES_DIR}/${g}/${g}"
+            if bt2_index_valid "$prefix"; then
+                printf 'DATABASE\t%s\t%s\n' "$g" "$prefix"
+            fi
+        done
+    } > "$SCREEN_CONF"
+
+    n_db=$(grep -c "^DATABASE" "$SCREEN_CONF" 2>/dev/null || echo 0)
+    if [ "$n_db" -gt 0 ]; then
+        ok "FastQ Screen panel ready: ${n_db} genome(s) — ${SCREEN_CONF}"
+    else
+        warn "FastQ Screen: no genomes built successfully — check warnings above"
+        warn "  The pipeline will run, but set run_fastq_screen=false in nextflow.config"
+    fi
 fi
 
 # ── tx2gene mapping (for Salmon — using Python for cross-system compatibility) ──
@@ -583,8 +874,26 @@ params {
     fastq_screen_conf   = "${SCREEN_CONF}"
 
     outdir              = "results"
-    max_memory          = "${TOTAL_RAM_INT} GB"
-    star_ram            = $(( TOTAL_RAM_INT * 600000000 ))
+
+    // ── Resource detection ────────────────────────────────────────────────
+    // CPU count is detected at pipeline-launch time by Groovy, so this adapts
+    // automatically to whatever machine runs the pipeline.
+    max_cpus            = Runtime.runtime.availableProcessors()
+
+    // RAM: detected by setup.sh (reliably, via /proc/meminfo) and set here as
+    // the default. It is a normal param, so moving to a different machine just
+    // needs an override:  nextflow run ... --max_memory_gb 64
+    // (We deliberately avoid JVM reflection for RAM — a bad cast there would
+    //  break the entire config parse, and JVM internals vary across builds.)
+    max_memory_gb       = ${TOTAL_RAM_INT}
+    max_memory          = "\${params.max_memory_gb} GB"
+    star_ram            = params.max_memory_gb * 600000000L
+
+    // Derived parallelism — runtime-dynamic, follows max_cpus
+    light_parallel      = Math.max(1, params.max_cpus - 1)
+    post_parallel       = Math.max(1, params.max_cpus - 2)
+    heavy_cpus          = Math.max(2, params.max_cpus.intdiv(2))
+    heavy_parallel      = params.max_cpus <= 4 ? 1 : 2
 
     // FASTQ source (null = download from SRA)
     fastq_dir           = null
@@ -610,8 +919,6 @@ params {
     run_multiqc             = true
 }
 
-def _totalCores = Runtime.runtime.availableProcessors()
-
 process {
     withLabel: 'download' {
         cpus     = 1
@@ -621,17 +928,17 @@ process {
     withLabel: 'pre_qc' {
         cpus     = 1
         memory   = '2 GB'
-        maxForks = Math.max(1, _totalCores - 1)
+        maxForks = params.light_parallel
     }
     withLabel: 'post_align' {
         cpus     = 1
         memory   = '4 GB'
-        maxForks = Math.max(1, _totalCores - 2)
+        maxForks = params.post_parallel
     }
     withLabel: 'heavy' {
-        cpus     = Math.max(2, (int)(_totalCores / 2))
+        cpus     = params.heavy_cpus
         memory   = params.max_memory
-        maxForks = ${STAR_PARALLEL}
+        maxForks = params.heavy_parallel
     }
     withLabel: 'screen' {
         cpus     = 2
@@ -639,7 +946,7 @@ process {
         maxForks = 1
     }
     withLabel: 'final' {
-        cpus   = _totalCores
+        cpus   = params.max_cpus
         memory = params.max_memory
     }
     withLabel: 'minimal' {
@@ -653,8 +960,8 @@ profiles {
     slurm    { process.executor = 'slurm'; process.queue = 'batch' }
 }
 
-report   { enabled = true; file = "\${params.outdir}/pipeline_report.html" }
-timeline { enabled = true; file = "\${params.outdir}/timeline.html" }
+report   { enabled = true; overwrite = true; file = "\${params.outdir}/pipeline_report.html" }
+timeline { enabled = true; overwrite = true; file = "\${params.outdir}/timeline.html" }
 NFEOF
 ok "nextflow.config written (tuned for ${CPU_CORES} cores, ${TOTAL_RAM_GB} GB RAM)"
 
