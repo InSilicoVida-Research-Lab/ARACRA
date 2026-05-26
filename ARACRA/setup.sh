@@ -96,17 +96,16 @@ for path in "${HOME}/miniforge3" "${HOME}/miniconda3" "${HOME}/anaconda3"; do
         break
     fi
 done
-
 if [ -z "$CONDA_BASE" ]; then
     log "No conda found — installing Miniforge3..."
-    curl -fsSL "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh" \
+    ARCH="$(uname -m)"
+    curl -fsSL "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-${ARCH}.sh" \
         -o /tmp/miniforge.sh
     bash /tmp/miniforge.sh -b -p "${HOME}/miniforge3"
     rm -f /tmp/miniforge.sh
     CONDA_BASE="${HOME}/miniforge3"
     ok "Miniforge3 installed"
 fi
-
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 ok "Conda: $(conda --version 2>&1) at ${CONDA_BASE}"
 
