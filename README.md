@@ -890,7 +890,9 @@ If that doesn't resolve it, run setup with `--skip-index` to at least get the re
 - Use the **▶ Check Tools** button in the sidebar to confirm all tools are installed
 - For Nextflow-specific issues: the Nextflow log is at `.nextflow.log` in the ARACRA directory
 - For any issue, create a ticket in issues section of GitHub.
-
+- currently configured for nextflow version 24.x.x. If higher version is installed, make sure you downgrade it.
+- For configuring ARACRA on DGX spark supporting ARM architecture of linux, please refere to the dgx_install_branch
 ---
 
 *ARACRA Pipeline · v2.0 · For research use*
+Contact: shubh.sharma@estudiants.urv.cat 
