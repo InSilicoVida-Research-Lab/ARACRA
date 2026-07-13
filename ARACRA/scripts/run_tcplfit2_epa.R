@@ -1,29 +1,7 @@
 #!/usr/bin/env Rscript
 # =============================================================================
-#  run_tcplfit2_epa.R — EPA gene-level HTTr tPOD workflow
-#
-#  Implements the gene-level (DESeq2 + tcplfit2) branch of:
-#    Harrill JA, Everett LJ, Haggard DE, Bundy JL, Willis CM, Shah I,
-#    Paul Friedman K, Basili D, Middleton A, Judson RS (2024).
-#    "Exploring the effects of experimental parameters and data modeling
-#     approaches on in vitro transcriptomic point-of-departure estimates."
-#    Toxicology 501:153694.  §2.5 (data processing) and §2.10.1 (gene_05,
-#    gene_abs5, gene_min).
-#
-#  THIS IS NOT the DRomics-matched script. Preprocessing deliberately departs
-#  from utils.R because the EPA workflow specifies a different one. Deltas:
-#
-#    | Step              | EPA (here)                      | ARACRA/DRomics        |
-#    |-------------------|---------------------------------|-----------------------|
-#    | Modelling unit    | PROBE-level counts              | gene-level (summed)   |
-#    | Probe -> gene     | max |L2FC| in either direction  | sum of probe counts   |
-#    | Feature filter    | mean count < 5 removed          | CPM>=1 in >=75% group |
-#    | Batch/plate       | covariate in DESeq2 design      | ComBat-seq            |
-#    | Response fitted   | shrunken L2FC per dose group    | VST/rlog per sample   |
-#    | Gene pre-select   | NONE (hitcall decides)          | itemselect trend test |
-#    | Criterion         | AIC                             | AICc                  |
-#    | Noise band        | cross-chemical, 2 lowest concs  | per-model residual SD |
-#
+#  run_tcplfit2_epa.R —  gene-level HTTr tPOD workflow
+
 #  PIPELINE (whole panel, in one run — the cutoff needs all chemicals)
 #    1. per chemical: DESeq2 on probe counts, jointly with plate-matched
 #       vehicle controls, design ~ plate + dose_group
@@ -40,19 +18,7 @@
 #       force.fit, bmd_low_bnd = 0.1 (BMD >= lowest conc / 10)
 #    6. active if hitcall > 0.9  ->  tPODs: gene_05 / gene_abs5 / gene_min
 #
-#  CAVEAT ON THE CUTOFF (read this before you write the methods section)
-#    Harrill 2024 spells the cutoff rule out only for SIGNATURES (§2.7): take
-#    the scores at the two lowest concentrations across all 44 chemicals and
-#    set the cutoff to the bounds of the 95% CI of that distribution. §2.10.1
-#    says only "fit using tcplfit2, starting with L2FC data" — it does not
-#    state the gene-level cutoff derivation. Step 4 above applies the signature
-#    rule per gene, which is the natural reading but IS AN INFERENCE. Two
-#    alternatives are exposed via --cutoff_method:
-#      panel_ci  (default) : 95% interval of the cross-chemical null, per gene
-#      panel_bmad          : 3 x MAD of the same null, per gene (ToxCast norm)
-#      fixed               : --cutoff_value on the log2 scale
-#    Report whichever you use, and say it is an inference if it is panel_ci.
-#
+
 #  USAGE
 #    python3 build_probe_matrix.py --counts_dir idxstats/ --outfile probe_counts.csv
 #    Rscript run_tcplfit2_epa.R \
