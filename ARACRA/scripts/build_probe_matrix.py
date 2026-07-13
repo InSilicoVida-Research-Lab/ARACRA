@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 #  build_probe_matrix.py — probe-level TempO-Seq count matrix
-#
-#  WHY THIS EXISTS
-#    temposeq_counts.py SUMS probes to gene level before modelling. The EPA
-#    HTTr workflow (Harrill et al. 2024, Toxicology 501:153694, §2.5) does NOT
-#    do that: it models at the PROBE level with DESeq2, and only afterwards
-#    aggregates to gene level by taking "the highest magnitude fold change for
-#    any associated probe in either direction".
-#
-#    Summing probe counts and taking max|L2FC| of probes are different
-#    estimators. Running the EPA pipeline on a summed matrix silently
-#    substitutes the aggregation rule. So: probe-level in, gene-level out at
-#    the L2FC step (done inside run_tcplfit2_epa.R).
-#
+
 #  Usage:
 #    python3 build_probe_matrix.py \
 #        --counts_dir path/to/idxstats \
