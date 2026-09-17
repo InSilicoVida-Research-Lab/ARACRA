@@ -273,6 +273,25 @@ apply_batch_correction <- function(counts, metadata, group_col = "Type") {
   })
 }
 
+# ── VST with automatic fallback for small gene panels ─────────────────────────
+# vst()'s default nsub=1000 subsampling assumes a whole-transcriptome dataset
+# and errors below that many genes ("less than 'nsub' rows"). TempO-Seq panels
+# (and this pipeline's own test fixture) routinely have far fewer — fall back
+# to the exact, non-subsampled transformation DESeq2's own error message
+# recommends, rather than crashing PCA/QC on every small-panel run.
+safe_vst <- function(dds, blind = TRUE) {
+  tryCatch(
+    vst(dds, blind = blind),
+    error = function(e) {
+      if (grepl("nsub", conditionMessage(e), fixed = TRUE)) {
+        varianceStabilizingTransformation(dds, blind = blind)
+      } else {
+        stop(e)
+      }
+    }
+  )
+}
+
 # ── PCA outlier detection (writes JSON + plot for app) ────────────────────────
 detect_pca_outliers <- function(counts, meta, outdir,
                                  group_col = "condition",
@@ -280,7 +299,7 @@ detect_pca_outliers <- function(counts, meta, outdir,
   suppressPackageStartupMessages({ library(ggplot2); library(ggrepel) })
 
   dds_qc <- DESeqDataSetFromMatrix(countData = counts, colData = meta, design = ~1)
-  vst_qc <- vst(dds_qc, blind = TRUE)
+  vst_qc <- safe_vst(dds_qc, blind = TRUE)
   pca_q <- prcomp(t(assay(vst_qc)))
   pca_data <- as.data.frame(pca_q$x[, 1:min(2, ncol(pca_q$x))])
   pct_var <- round(100 * pca_q$sdev^2 / sum(pca_q$sdev^2))

@@ -1,37 +1,68 @@
-# Python
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 env/
 venv/
-*.env
-.env
 
-# IDE / Editor folders
+# ── Local machine config (written by setup.sh / run_app.sh) ──────────────────
+.env
+*.env
+ARACRA/.env
+ARACRA/.app.pid
+ARACRA/.pipeline_state.json
+ARACRA/.pipeline.pid
+# nextflow.config IS tracked as a template; setup.sh overwrites it locally.
+ARACRA/nextflow.config.local
+
+# ── Nextflow runtime ─────────────────────────────────────────────────────────
+.nextflow/
+.nextflow.log*
+work/
+results/
+ARACRA/work/
+ARACRA/results/
+
+# ── IDE / editor ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.sublime-project
 *.sublime-workspace
 
-# macOS
+# ── macOS ────────────────────────────────────────────────────────────────────
 .DS_Store
 
-# Application Output & User Data (IMPORTANT)
-# Prevents users from accidentally committing their results
+# ── Pipeline output & user data ──────────────────────────────────────────────
+# Scoped to output directories so that tracked inputs (metadata_input.csv,
+# TempO-Seq manifests, lockfiles, example figures) are NOT silently ignored.
 rnaseq_pipeline/
+aracra_star_work/
 deg_results/
 dromics_results/
+**/deg_results/
+**/dromics_results/
+**/multiqc_data/
 *.zip
-*.csv
-*.log
-*.out
-*.txt
-*.png
+
+# Sequencing data and alignments (never commit these)
 *.bam
+*.bai
 *.sam
 *.sra
 *.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
 
 # Temp files created by the app
 *_fastq_temp/
+
+# Shell redirect accidents (e.g. an unquoted 'salmon>=1.10')
+=*
+
+# ── Test scratch ─────────────────────────────────────────────────────────────
+tests/.out/
+tests/fixtures/counts_matrix.csv
+tests/fixtures/metadata.csv
+tests/fixtures/ground_truth.csv

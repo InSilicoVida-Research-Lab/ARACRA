@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  ARACRA-STAR Pipeline — run_app.sh
-#  Launches Streamlit app with test_ARCRA conda env
+#  ARACRA Pipeline — run_app.sh
+#  Launches the Streamlit app inside the ARACRA conda env.
 # =============================================================================
 set -euo pipefail
 
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${1:-8502}"
+# shellcheck source=lib/aracra_common.sh
+source "${PIPELINE_DIR}/lib/aracra_common.sh"
+
+PORT="${1:-$ARACRA_DEFAULT_PORT}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -14,20 +17,18 @@ echo "║       ARACRA— Launching App                       ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
 # Try to detect conda
-CONDA_BASE="${HOME}/miniforge3"
-[ ! -d "$CONDA_BASE" ] && CONDA_BASE="${HOME}/miniconda3"
-[ ! -d "$CONDA_BASE" ] && CONDA_BASE="$(conda info --base 2>/dev/null || echo "")"
+CONDA_BASE="$(aracra_find_conda || true)"
 
-if [ -z "$CONDA_BASE" ] || [ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
-    echo "ERROR: Cannot find conda. Install miniforge3 or set CONDA_BASE."
+if [ -z "$CONDA_BASE" ]; then
+    echo "ERROR: Cannot find conda. Run 'bash setup.sh' first, or install Miniforge3."
     exit 1
 fi
 
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
-# Activate rnaseq_pipeline env — try common names
+# Activate the ARACRA env — try the canonical name, then legacy names
 ENV_NAME=""
-for try_name in test_ARACRA rnaseq_pipeline2 rnaseq_pipeline; do
+for try_name in "${ARACRA_ENV_FALLBACKS[@]}"; do
     if conda activate "$try_name" 2>/dev/null; then
         ENV_NAME="$try_name"
         echo "  ✔ Activated: ${ENV_NAME}"
@@ -35,7 +36,7 @@ for try_name in test_ARACRA rnaseq_pipeline2 rnaseq_pipeline; do
     fi
 done
 if [ -z "$ENV_NAME" ]; then
-    echo "ERROR: Environment 'test_ARACRA' (or rnaseq_pipeline2) not found."
+    echo "ERROR: Environment '${ARACRA_ENV_NAME}' not found."
     echo "  Run setup.sh first."
     exit 1
 fi
@@ -46,30 +47,16 @@ if ! command -v streamlit &>/dev/null; then
     pip install streamlit pandas openpyxl --quiet
 fi
 
-# Write .env if not exists
+# Write .env if missing. setup.sh is the normal author; this is a fallback that
+# uses the SAME writer, so the key set can never drift between the two scripts.
 ENV_PATH="${CONDA_BASE}/envs/${ENV_NAME}"
 if [ ! -f "${PIPELINE_DIR}/.env" ]; then
-    cat > "${PIPELINE_DIR}/.env" <<EOF
-CONDA_BASE=${CONDA_BASE}
-ENV_NAME=${ENV_NAME}
-ENV_PATH=${ENV_PATH}
-ENV_BIN=${ENV_PATH}/bin
-WORK_DIR=${HOME}/aracra_star_work/work
-OUT_DIR=${HOME}/aracra_star_work/results
-LOG_FILE=${HOME}/aracra_star_work/pipeline.log
-STAR_INDEX=${HOME}/databases/hg38_reference/star_index_hg38
-HISAT2_INDEX=${HOME}/databases/hg38_reference/hisat2_index_hg38/genome_tran
-SALMON_INDEX=${HOME}/databases/hg38_reference/salmon_index_hg38
-GTF_PATH=${HOME}/databases/hg38_reference/gencode.v44.primary_assembly.annotation.gtf
-BED_PATH=${HOME}/databases/annotations/hg38_RefSeq.bed
-HK_BED_PATH=${HOME}/databases/annotations/hg38_housekeeping.bed
-REFFLAT_PATH=${HOME}/databases/annotations/hg38_refFlat.txt
-SCREEN_CONF_PATH=${HOME}/databases/fastq_screen_genomes/FastQ_Screen_Genomes/fastq_screen.conf
-EOF
+    echo "  ! .env not found — writing defaults (run setup.sh for a tuned config)"
+    aracra_write_env "$PIPELINE_DIR" "$CONDA_BASE" "$ENV_PATH" "$ARACRA_DB_DIR" "run_app.sh"
     echo "  ✔ .env created"
 fi
 
-mkdir -p "${HOME}/aracra_star_work/work" "${HOME}/aracra_star_work/results"
+mkdir -p "${ARACRA_WORK_ROOT}/work" "${ARACRA_WORK_ROOT}/results"
 
 # Quick tool check
 echo ""
@@ -92,7 +79,7 @@ fi
 
 # Launch
 echo ""
-APP_LOG="${HOME}/aracra_star_work/streamlit.log"
+APP_LOG="${ARACRA_WORK_ROOT}/streamlit.log"
 nohup streamlit run "${PIPELINE_DIR}/aracra_star_app.py" \
     --server.port "$PORT" \
     --server.headless true \

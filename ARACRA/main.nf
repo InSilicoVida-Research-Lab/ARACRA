@@ -28,10 +28,18 @@ params.exclude_samples  = ""
 params.cleanup_work     = false
 params.run_qc_only      = false
 
+// ── Pathway enrichment (ORA on DESeq2 DEGs) ──
+params.run_enrichment    = false
+params.enrich_databases  = "GO_BP,KEGG,REACTOME,MSIGDB_H"
+params.enrich_padj       = 0.05
+params.enrich_qvalue     = 0.2
+
 // ── BMD Quality Filters ──
 params.bmdu_bmdl_ratio     = 40.0
 params.bmd_max_dose_filter = true
 params.bmd_extrap_factor   = 10.0
+params.bmd_extrap_filter   = false   // flag only by default; true = also remove
+params.pathway_min_coverage = 20.0   // coverage-gated tPOD threshold (%); does not affect the NTP 2018 tPOD
 params.fold_change_min     = 0.0
 params.use_msigdb          = true
 
@@ -102,6 +110,7 @@ ${!params.fastq_dir && !params.trimmed_dir && !direct_mode ? '║  FASTQ source 
 ║  13.  MultiQC            : ${params.run_multiqc}
 ║  14.  DESeq2             : ${params.run_deg}
 ║  15.  DRomics/BMD        : ${params.run_dromics}
+║  16.  Pathway enrichment : ${params.run_enrichment}
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -787,6 +796,36 @@ process DESEQ2_ANALYSIS {
     """
 }
 
+// ---- Pathway Enrichment (ORA on DESeq2 DEGs) ----
+// GO/KEGG/Reactome/MSigDB via clusterProfiler + ReactomePA + msigdbr — see
+// scripts/run_enrichment.R for citations. Depends on DESEQ2_ANALYSIS output
+// (Custom_Filtered_DEGs.csv, All_Results.csv), so it only makes sense chained
+// after it, gated on params.run_deg as well as params.run_enrichment.
+process ENRICHMENT_ANALYSIS {
+    label 'final'
+    publishDir "${run_base}/deg_results/enrichment", mode: 'copy'
+    errorStrategy 'finish'
+
+    input:
+    path deg_csvs
+
+    output:
+    path("*.csv"),  optional: true, emit: csvs
+    path("*.png"),  optional: true, emit: plots
+    path("*.json"), optional: true, emit: summary
+
+    script:
+    """
+    Rscript ${projectDir}/scripts/run_enrichment.R \
+        --degs          Custom_Filtered_DEGs.csv \
+        --all_results   All_Results.csv \
+        --outdir        . \
+        --databases     "${params.enrich_databases}" \
+        --padj_cutoff   ${params.enrich_padj} \
+        --qvalue_cutoff ${params.enrich_qvalue}
+    """
+}
+
 // ---- DRomics / BMD Analysis ----
 process DROMICS_ANALYSIS {
     label 'final'
@@ -823,8 +862,10 @@ process DROMICS_ANALYSIS {
         --bmdu_bmdl_ratio ${params.bmdu_bmdl_ratio} \
         --bmd_max_dose_filter ${params.bmd_max_dose_filter} \
         --bmd_extrap_factor ${params.bmd_extrap_factor} \
+        --bmd_extrap_filter ${(params.bmd_extrap_filter == true || params.bmd_extrap_filter == "true") ? 'TRUE' : 'FALSE'} \
         --fold_change_min ${params.fold_change_min} \
-        --read_thresh ${params.read_threshold}
+        --read_thresh ${params.read_threshold} \
+        --pathway_min_coverage ${params.pathway_min_coverage}
     """
 }
 
@@ -958,6 +999,9 @@ workflow {
             log.info "⚡ Direct analysis mode — running DESeq2/DRomics"
             if (params.run_deg == true || params.run_deg == "true") {
                 DESEQ2_ANALYSIS(count_ch, metadata_ch)
+                if (params.run_enrichment == true || params.run_enrichment == "true") {
+                    ENRICHMENT_ANALYSIS(DESEQ2_ANALYSIS.out.csvs)
+                }
             }
             if (params.run_dromics == true || params.run_dromics == "true") {
                 DROMICS_ANALYSIS(
@@ -1202,6 +1246,9 @@ workflow {
 
         if (params.run_deg == true || params.run_deg == "true") {
             DESEQ2_ANALYSIS(final_counts_ch, file(params.metadata))
+            if (params.run_enrichment == true || params.run_enrichment == "true") {
+                ENRICHMENT_ANALYSIS(DESEQ2_ANALYSIS.out.csvs)
+            }
         }
         if (params.run_dromics == true || params.run_dromics == "true") {
             DROMICS_ANALYSIS(final_counts_ch, file(params.metadata))
