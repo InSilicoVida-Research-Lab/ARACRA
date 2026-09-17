@@ -79,11 +79,14 @@ Open a terminal and run:
 # If you haven't already, install git
 sudo apt update && sudo apt install -y git
 
-# Clone (or download and extract) the ARACRA folder
 cd ~/Downloads
-# (the ARACRA folder should already be here if you received it directly)
-cd ARACRA
+git clone https://github.com/InSilicoVida-Research-Lab/ARACRA.git
+# The pipeline itself lives one level down, inside the repo:
+cd ARACRA/ARACRA
 ```
+
+> **On a DGX Spark or other ARM64 Linux machine**, use the `dgx_install_branch`
+> instead: `git clone -b dgx_install_branch https://github.com/InSilicoVida-Research-Lab/ARACRA.git`
 
 ### Step 2 — Check your disk space
 
@@ -94,6 +97,10 @@ df -h ~
 ```
 
 If you want to store the databases somewhere other than `~/databases` (e.g. a large external drive), note the path — you'll pass it to setup with `--db-dir`.
+
+All scripts read their shared defaults (environment name, port, database and work
+directories, pinned tool versions) from `lib/aracra_common.sh`. Change a default
+there once rather than in each script.
 
 ### Step 3 — Run setup
 
@@ -109,6 +116,8 @@ The setup script will:
 5. Build alignment indexes (STAR takes 30–45 min; HISAT2 index is downloaded pre-built)
 6. Build the Salmon index with genome decoys
 7. Install all required **R packages** including DESeq2, DRomics, edgeR, and pathway databases
+8. Apply light version constraints (see below) and write `.env` and `nextflow.config`
+9. Write `aracra_versions.txt` — a record of what actually got installed
 
 **Expect this to take 1–3 hours** the first time, mostly waiting for downloads and index building.
 
@@ -213,7 +222,7 @@ cp -r /mnt/c/Users/YourName/Downloads/ARACRA ~/Downloads/ARACRA
 ### Step 5 — Run setup (same as Linux)
 
 ```bash
-cd ~/Downloads/ARACRA
+cd ~/Downloads/ARACRA/ARACRA
 bash setup.sh
 ```
 
@@ -251,7 +260,9 @@ You'll see output like:
 
 Open that URL in your browser. Leave the terminal running in the background — the pipeline continues even if you close the browser tab.
 
-> **The pipeline keeps running even if you close the browser.** It runs as a detached background process. You can come back hours later, re-open the app, and see your results.
+> **The pipeline keeps running even if you close the browser.** Both the app and the
+> Nextflow run are detached background processes. You can come back hours later,
+> re-open the app, and see your results.
 
 ---
 
@@ -807,6 +818,46 @@ Then uncheck "Resume" in the sidebar for the next run (it will redo everything f
 
 ---
 
+### A package version changed and something broke
+
+Nothing extra to install or run — this is handled in three places automatically.
+
+**Nextflow is bounded.** `main.nf` uses 24.x semantics, and `nextflow.config`
+declares `nextflowVersion = '>=24.04.0, <25.0.0'`. Nextflow checks this itself
+and stops with a plain-English message before anything runs. No more "downgrade
+it yourself" note to remember.
+
+**Other tools have a floor, not a pin.** `setup.sh` asks for minimum versions
+(Salmon ≥ 1.10, samtools ≥ 1.17, and so on) but never a maximum, so it will not
+drag a newer working install backwards. If the constrained solve fails for any
+reason, setup retries without the floors and tells you — the install always
+finishes. The floors live in one place, `lib/aracra_common.sh`.
+
+**The app warns you.** Click **▶ Check Tools** in the sidebar: a green ✔ means
+fine, an amber ⚠ means the tool is present but older than expected, red ✘ means
+missing. An amber warning is usually harmless — it is there so that if results
+look wrong, you have somewhere to look first.
+
+**And there is a record.** `aracra_versions.txt` in the pipeline folder lists
+every tool and R package version. Attach it to a GitHub issue, or keep a copy
+with a manuscript — if a run that worked in March fails in November, comparing
+two of these files usually finds it in a minute.
+
+```bash
+cat aracra_versions.txt          # what you have now
+bash setup.sh                    # re-runs safely; updates the record
+```
+
+If you need a specific version, install it into the env by hand and re-run the
+app — nothing in the pipeline will fight you:
+
+```bash
+conda activate ~/miniforge3/envs/test_ARACRA
+mamba install -c bioconda 'salmon=1.10.3' -y
+```
+
+---
+
 ### Dependency version conflicts halt the setup
 
 Mamba occasionally hits unsolvable conflicts when it tries to satisfy all package constraints simultaneously — especially on machines with an existing conda base that has pinned versions. You'll see something like:
@@ -867,7 +918,8 @@ bash setup.sh
 
 **Step 5 — Salmon GLIBC incompatibility (separate issue):**
 
-On some older Linux systems or certain WSL2 configurations, Salmon installs but fails to run:
+`setup.sh` installs `salmon>=1.10` (quoted, so the shell does not treat `>=` as a
+redirect). If you installed Salmon by hand and got an older build, you may see:
 
 ```
 salmon: /lib/x86_64-linux-gnu/libc.so.6: version GLIBC_2.34 not found
@@ -889,9 +941,19 @@ If that doesn't resolve it, run setup with `--skip-index` to at least get the re
 - Check the live log first (`~/aracra_star_work/pipeline.log`) — it usually contains the exact error
 - Use the **▶ Check Tools** button in the sidebar to confirm all tools are installed
 - For Nextflow-specific issues: the Nextflow log is at `.nextflow.log` in the ARACRA directory
-- For any issue, create a ticket in issues section of GitHub.
-- currently configured for nextflow version 24.x.x. If higher version is installed, make sure you downgrade it.
-- For configuring ARACRA on DGX spark supporting ARM architecture of linux, please refere to the dgx_install_branch
+- For any issue, create a ticket in the Issues section of GitHub.
+- `main.nf` is written against **Nextflow 24.x**. `setup.sh` now pins this for you
+  (`nextflow=24.10`), so no manual downgrade is needed. If you are using a
+  system Nextflow outside the conda env, check `nextflow -version` yourself.
+- For ARACRA on a DGX Spark (ARM64 Linux), use the `dgx_install_branch`.
+
+### Branches
+
+| Branch | Purpose |
+| ------ | ------- |
+| `main` | x86-64 Linux / WSL2 — the version this manual describes |
+| `dgx_install_branch` | ARM64 setup for the DGX Spark |
+| `tcplfit_integration` | tcplfit2 concentration-response sensitivity analysis |
 ---
 
 *ARACRA Pipeline · v2.0 · For research use*

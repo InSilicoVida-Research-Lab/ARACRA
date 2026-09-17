@@ -29,8 +29,8 @@ option_list <- list(
               help = "BMD z-value (signal-to-noise ratio threshold)"),
   make_option("--bmd_x",           type = "double",    default = 10.0,
               help = "BMD x-value (percent change threshold)"),
-  make_option("--niter",           type = "integer",   default = 20000L,
-              help = "Bootstrap iterations for BMD confidence intervals"),
+  make_option("--niter",           type = "integer",   default = 1000L,
+              help = "Bootstrap iterations for BMD confidence intervals (matches app/README default)"),
   make_option("--exclude_samples", type = "character", default = NULL),
   make_option("--bmdu_bmdl_ratio", type = "double",    default = 40,
               help = "BMDU/BMDL ratio threshold (NTP=40, EFSA=50)"),
@@ -40,6 +40,15 @@ option_list <- list(
               help = "Remove genes with BMD > highest tested dose (NTP 2018)"),
   make_option("--bmd_extrap_factor",   type = "double",  default = 10,
               help = "Flag genes with BMD < lowest_dose / this factor (NTP 2018)"),
+  make_option("--bmd_extrap_filter",   type = "logical", default = FALSE,
+              help = paste("Also REMOVE extrapolated genes from the tPOD gene set.",
+                           "FALSE (default) = flag only, matching published ARACRA runs;",
+                           "TRUE = drop them, which raises the low-end tPOD estimates.")),
+  make_option("--pathway_min_coverage", type = "double", default = 20.0,
+              help = paste("Minimum coverage (%) a gene set must have to be eligible for the",
+                           "coverage-gated tPOD (a second method reported alongside the NTP",
+                           "2018 one, not a replacement for it -- see pathway_credible in",
+                           "tpod_methods). Does not affect the primary NTP 2018 tPOD.")),
   make_option("--read_thresh",         type = "integer",  default = 0L,
               help = "Min total reads per sample (0=disabled; default 0 for TempO-Seq compatibility)")
 )
@@ -58,6 +67,43 @@ suppressPackageStartupMessages({
   library(DRomics); library(parallel); library(AnnotationDbi)
   if (requireNamespace("GO.db", quietly = TRUE)) library(GO.db)
 })
+
+# ── DRomics defensive patch: NA-safe Gaussian out-of-range checks ───────────
+# DRomics 2.6.3's f{L}Gauss{4,5}poutofrange() helpers divide by the fitted
+# model's 'f' parameter to locate the curve's extremum. When f ~= 0 — which
+# DRomics itself fits as a normal, enabled-by-default candidate model
+# (enablesfequal0inGP/enablesfequal0inLGP) — that division produces NaN,
+# which becomes a bare NA "success" flag and crashes drcfit() outright for
+# the WHOLE gene set: "Error in if ((!Gauss4psucces) && (!Gauss5psucces)) :
+# missing value where TRUE/FALSE needed". Reproduced deterministically on
+# real hg38 RNA-seq data (2026-09-17) — same gene, same model, every run;
+# confirmed present in the current CRAN release (2.6.3 is both installed
+# and latest), so there is no version bump that fixes it.
+#
+# Fix: wrap the four helpers so a NaN/NA result is treated as "out of range"
+# — the conservative reading already implied by the function's job: an
+# indeterminate check can't certify the fit is IN range, so reject that one
+# candidate model for that one gene instead of crashing every gene's fit.
+# No other behavior changes; every gene that fit fine before still does.
+.na_safe_outofrange <- function(fn) {
+  force(fn)  # must force here: an unforced promise re-evaluates get(nm, ...)
+             # using nm's value AFTER the loop below finishes, not per-iteration
+             # — every patched function ends up calling the last one, which
+             # calls itself, infinitely. (Caught by testing before this shipped.)
+  function(fit, signalmin, signalmax) {
+    out <- fn(fit, signalmin, signalmax)
+    if (length(out) != 1 || is.na(out)) TRUE else out
+  }
+}
+for (.nm in c("fGauss4poutofrange", "fGauss5poutofrange",
+              "fLGauss4poutofrange", "fLGauss5poutofrange")) {
+  if (exists(.nm, envir = asNamespace("DRomics"), inherits = FALSE)) {
+    assignInNamespace(.nm, .na_safe_outofrange(get(.nm, envir = asNamespace("DRomics"),
+                                                     inherits = FALSE)),
+                       ns = "DRomics")
+  }
+}
+rm(.nm)
 
 if (!dir.exists(opt$outdir)) dir.create(opt$outdir, recursive = TRUE)
 
@@ -202,10 +248,17 @@ if (n_selected > 0) {
   write.csv(sel_df, file.path(opt$outdir, "selected_responding_genes.csv"), row.names = FALSE)
 
   n_cores <- max(1, parallel::detectCores() - 1)
-  cat("Using", n_cores, "cores for parallel processing\n")
 
+  # Deliberately serial (parallel = "no"), not "snow": drcfit()'s PSOCK
+  # cluster workers are fresh R processes that reload DRomics unpatched, so
+  # the NA-safe fix above (applied only in this session) would not reach
+  # them there, and this step has no fallback-on-failure — it would crash
+  # the whole analysis exactly as before. Serial fitting measured at a few
+  # minutes for ~1500 genes on real data; acceptable within a multi-hour
+  # pipeline, and correct beats fast here.
+  cat("Fitting dose-response models (serial — see comment above)...\n")
   f <- drcfit(itemselect = s, information.criterion = opt$criterion,
-               progressbar = FALSE, parallel = "snow", ncpus = n_cores)
+               progressbar = FALSE, parallel = "no")
   n_fitted <- nrow(f$fitres)
   cat("Models fitted (before FC filter):", n_fitted, "\n")
 
@@ -468,6 +521,27 @@ if (n_selected > 0) {
           tryCatch({
             cl <- parallel::makeCluster(n_cores)
             parallel::clusterEvalQ(cl, library(DRomics))
+            # Same NA-safe patch as above (see that comment for why), applied
+            # per-worker since these are fresh processes with their own
+            # unpatched DRomics namespace.
+            parallel::clusterEvalQ(cl, {
+              .na_safe_outofrange <- function(fn) {
+                force(fn)
+                function(fit, signalmin, signalmax) {
+                  out <- fn(fit, signalmin, signalmax)
+                  if (length(out) != 1 || is.na(out)) TRUE else out
+                }
+              }
+              for (.nm in c("fGauss4poutofrange", "fGauss5poutofrange",
+                            "fLGauss4poutofrange", "fLGauss5poutofrange")) {
+                if (exists(.nm, envir = asNamespace("DRomics"), inherits = FALSE)) {
+                  assignInNamespace(.nm, .na_safe_outofrange(get(.nm, envir = asNamespace("DRomics"),
+                                                                  inherits = FALSE)),
+                                     ns = "DRomics")
+                }
+              }
+              NULL
+            })
             parallel::clusterExport(cl, "r_bmd", envir = environment())
             b_bmd <- bmdboot(r = r_bmd, niter = opt$niter, progressbar = FALSE, cl = cl)
             cat("Bootstrap completed successfully\n")
@@ -522,15 +596,29 @@ if (n_selected > 0) {
               }
             }
 
-            # ── Gap 3: Flag BMD < lowest_dose / extrap_factor (NTP 2018) ─────
+            # ── Gap 3: BMD < lowest_dose / extrap_factor (NTP 2018) ──────────
+            # Flagging is always performed. Removal is opt-in via
+            # --bmd_extrap_filter so that the default reproduces published runs.
             extrap_threshold <- min_dose / opt$bmd_extrap_factor
             valid$bmd_extrapolated <- valid$BMD.zSD < extrap_threshold
-            n_extrapolated <- sum(valid$bmd_extrapolated, na.rm = TRUE)
+            valid$bmd_extrapolated[is.na(valid$bmd_extrapolated)] <- FALSE
+            n_extrapolated <- sum(valid$bmd_extrapolated)
+            n_removed_extrap <- 0
             if (n_extrapolated > 0) {
               cat("NTP extrapolation flag:", n_extrapolated, "genes with BMD <",
                   round(extrap_threshold, 6), "(lowest dose /", opt$bmd_extrap_factor, ")\n")
-              cat("  These are flagged but NOT removed (used in gene-level tPOD,\n")
-              cat("  but pathway tPODs driven by flagged genes will be noted)\n")
+            }
+            if (isTRUE(opt$bmd_extrap_filter)) {
+              n_removed_extrap <- n_extrapolated
+              if (n_extrapolated > 0) {
+                cat("  --bmd_extrap_filter=TRUE: removing", n_extrapolated,
+                    "extrapolated genes from the tPOD gene set\n")
+                valid <- valid[!valid$bmd_extrapolated, ]
+              }
+            } else if (n_extrapolated > 0) {
+              cat("  Flagged but NOT removed (default; --bmd_extrap_filter=TRUE to remove).\n")
+              cat("  These genes remain in the gene-level and pathway tPOD gene set,\n")
+              cat("  so low-end tPODs (rank25, perc05) may sit below the tested range.\n")
             }
 
             # ── Gap 1: BMDU/BMDL ratio filter (configurable threshold) ───────
@@ -576,6 +664,8 @@ if (n_selected > 0) {
               extrap_factor      = opt$bmd_extrap_factor,
               extrap_threshold   = extrap_threshold,
               n_extrapolated     = n_extrapolated,
+              extrap_filter      = isTRUE(opt$bmd_extrap_filter),
+              n_removed_extrap   = n_removed_extrap,
               ratio_threshold    = ratio_threshold,
               n_removed_ratio    = n_ratio_filtered,
               has_bootstrap_ci   = has_ci,
@@ -937,7 +1027,14 @@ if (bmd_performed && nrow(valid_efsa) >= 5) {
     ntp_pass <- ntp_pass[order(ntp_pass$median_bmd), ]
     n_pathways_pass <- nrow(ntp_pass)
 
-    cat("Pathways passing NTP criteria:", n_pathways_pass, "\n")
+    # Marks which NTP-passing gene sets also clear the (stricter, optional)
+    # coverage bar used by the coverage-gated tPOD below. Purely informational
+    # here -- it does not filter ntp_pass or change the NTP 2018 tPOD.
+    ntp_pass$credible <- ntp_pass$coverage_pct >= opt$pathway_min_coverage
+    n_pathways_credible <- sum(ntp_pass$credible)
+
+    cat("Pathways passing NTP criteria:", n_pathways_pass,
+        "(", n_pathways_credible, "also >=", opt$pathway_min_coverage, "% coverage )\n")
 
     if (n_pathways_pass > 0) {
 
@@ -1022,6 +1119,39 @@ if (bmd_performed && nrow(valid_efsa) >= 5) {
         coverage_pct = tpod_row$coverage_pct
       )
 
+      # ── Coverage-gated tPOD (ARACRA extension, not part of NTP 2018) ───────
+      # Same selection rule as above -- lowest median BMD wins -- but only
+      # among gene sets that also clear pathway_min_coverage. NTP 2018 takes
+      # the unconditional minimum across every gene set that passed its
+      # (n>=3, coverage>=5%) filter; a 3-gene, 13%-coverage set and a
+      # 14-gene, 88%-coverage set compete on equal footing there. This method
+      # answers a different, narrower question -- "most sensitive AMONG
+      # well-supported gene sets" -- for exactly the cases (see pathway curve
+      # plots below) where a thin winner and a well-covered runner-up give
+      # very different answers.
+      credible_rows <- ntp_pass[ntp_pass$credible, ]
+      if (nrow(credible_rows) > 0) {
+        cred_row <- credible_rows[1, ]  # already sorted by median_bmd
+        tpod_methods$pathway_credible <- list(
+          value = round(cred_row$median_bmd, 6),
+          label = paste0("Lowest Pathway Median BMD, >=", opt$pathway_min_coverage, "% coverage"),
+          ref   = "ARACRA extension -- not part of NTP 2018",
+          n_genes_used = cred_row$n_genes_bmd,
+          pathway_name = cred_row$pathway_name,
+          pathway_id   = cred_row$pathway_id,
+          coverage_pct = cred_row$coverage_pct
+        )
+        cat("  Coverage-gated tPOD:", round(cred_row$median_bmd, 4), "uM (",
+            cred_row$pathway_name, ",", cred_row$coverage_pct, "% coverage )\n")
+      } else {
+        tpod_methods$pathway_credible <- list(
+          value = NA, label = paste0("Lowest Pathway Median BMD, >=", opt$pathway_min_coverage, "% coverage"),
+          ref = "ARACRA extension -- not part of NTP 2018",
+          n_genes_used = NA, pathway_name = NA, pathway_id = NA, coverage_pct = NA
+        )
+        cat("  Coverage-gated tPOD: no gene set reached", opt$pathway_min_coverage, "% coverage\n")
+      }
+
       tpod_summary <- list(
         tpod_value       = tpod_value,
         tpod_pathway     = tpod_row$pathway_name,
@@ -1031,6 +1161,8 @@ if (bmd_performed && nrow(valid_efsa) >= 5) {
         tpod_coverage    = tpod_row$coverage_pct,
         tpod_method      = "NTP2018_gene_set",
         n_pathways_tested = n_pathways_pass,
+        n_pathways_credible = n_pathways_credible,
+        pathway_min_coverage = opt$pathway_min_coverage,
         gene_level_median = bmd_summary$median_bmd,
         gene_level_q25    = round(quantile(valid_efsa$BMD.zSD, 0.25), 6),
         tpod_methods     = tpod_methods,
@@ -1038,7 +1170,8 @@ if (bmd_performed && nrow(valid_efsa) >= 5) {
         top5_pathways    = lapply(seq_len(min(5, nrow(ntp_pass))), function(i) {
           list(name = ntp_pass$pathway_name[i], id = ntp_pass$pathway_id[i],
                category = ntp_pass$category[i], median_bmd = ntp_pass$median_bmd[i],
-               n_genes = ntp_pass$n_genes_bmd[i], coverage = ntp_pass$coverage_pct[i])
+               n_genes = ntp_pass$n_genes_bmd[i], coverage = ntp_pass$coverage_pct[i],
+               credible = ntp_pass$credible[i])
         })
       )
 
@@ -1049,8 +1182,8 @@ if (bmd_performed && nrow(valid_efsa) >= 5) {
 
       # Save pathway results
       out_cols <- intersect(c("pathway_id", "pathway_name", "category", "n_genes_bmd",
-                               "total_genes", "coverage_pct", "median_bmd", "mean_bmd",
-                               "q25_bmd", "min_bmd", "gene_list"), colnames(ntp_pass))
+                               "total_genes", "coverage_pct", "credible", "median_bmd",
+                               "mean_bmd", "q25_bmd", "min_bmd", "gene_list"), colnames(ntp_pass))
       write.csv(ntp_pass[, out_cols],
                 file.path(opt$outdir, "pathway_bmd_summary.csv"), row.names = FALSE)
 
@@ -1080,6 +1213,72 @@ if (bmd_performed && nrow(valid_efsa) >= 5) {
               axis.text.y = element_text(size = 8))
       ggsave(file.path(opt$outdir, "pathway_sensitivity.png"), p_pathway,
              width = 12, height = max(6, 0.35 * n_plot_pw), dpi = 300)
+
+      # ── Per-pathway dose-response curves (top N pathways) ───────────────────
+      # One plot per pathway: overlay each member gene's already-fitted curve
+      # using DRomics' own curvesplot(), fed with the exact rows of
+      # valid_efsa (== the bmdcalc()/EFSA-filtered results table) that
+      # gene2pathway was built from — so a thin, noisy bundle of lines here
+      # is the same "small overlapping gene set" risk the pathway ranking
+      # itself can't see, made visible. No new model is fit; curvesplot()
+      # reconstructs each curve from the parametric fit already stored in
+      # that row (model + parameters), same as the tPOD number itself uses.
+      #
+      # ID note: gene2pathway$gene_id is ENSEMBL; valid_efsa$id is whatever
+      # f$fitres$id was at fit time (symbol, with ENSEMBL fallback — see the
+      # bmd_gene_ids bridge above). ensembl_to_valid_id inverts that bridge
+      # so a pathway's ENSEMBL member list can select the matching rows of
+      # valid_efsa for curvesplot().
+      cat("\nGenerating per-pathway dose-response curve plots...\n")
+      N_PATHWAY_CURVES <- min(10, nrow(ntp_pass))
+      ensembl_to_valid_id <- setNames(valid_efsa$id, bmd_gene_ids)
+      dose_max_pw <- max(final_meta$dose_numeric)
+
+      plot_one_pathway_curve <- function(pw_row) {
+        pid <- pw_row$pathway_id
+        members <- gene2pathway[gene2pathway$pathway_id == pid, ]
+        members <- members[!duplicated(members$gene_id), ]
+        valid_ids <- unique(na.omit(unname(ensembl_to_valid_id[members$gene_id])))
+        subset_res <- valid_efsa[valid_efsa$id %in% valid_ids, ]
+        if (nrow(subset_res) == 0) return(NULL)
+
+        p <- tryCatch(
+          curvesplot(subset_res, xmax = dose_max_pw, dose_log_transfo = FALSE,
+                     addBMD = TRUE, BMDtype = "zSD",
+                     line.size = 0.6, line.alpha = 0.6,
+                     point.size = 1.2, point.alpha = 0.6) +
+            geom_vline(xintercept = pw_row$median_bmd, linetype = "dashed",
+                       color = "#FF5722", linewidth = 0.6) +
+            labs(
+              title = paste0(pw_row$pathway_name, " (", pid, ")"),
+              subtitle = paste0(nrow(subset_res), "/", pw_row$total_genes, " genes (",
+                                 pw_row$coverage_pct, "% coverage) — median BMD = ",
+                                 round(pw_row$median_bmd, 4),
+                                 " μM (dashed line) — points = each gene's own BMD")
+            ) +
+            theme(plot.title = element_text(size = 12, face = "bold"),
+                  plot.subtitle = element_text(size = 8.5, color = "grey40")),
+          error = function(e) { cat("  curvesplot failed for", pid, ":", conditionMessage(e), "\n"); NULL }
+        )
+        if (is.null(p)) return(NULL)
+
+        safe_id <- gsub("[^A-Za-z0-9_.-]", "_", pid)
+        fname <- paste0("pathway_curve_", safe_id, ".png")
+        ggsave(file.path(opt$outdir, fname), p, width = 8, height = 6, dpi = 300)
+        list(pathway_id = pid, file = fname, n_curves = nrow(subset_res))
+      }
+
+      pathway_curve_files <- list()
+      for (i in seq_len(N_PATHWAY_CURVES)) {
+        res <- tryCatch(plot_one_pathway_curve(ntp_pass[i, ]), error = function(e) {
+          cat("  curve plot failed for", ntp_pass$pathway_id[i], ":", e$message, "\n")
+          NULL
+        })
+        if (!is.null(res)) pathway_curve_files[[length(pathway_curve_files) + 1]] <- res
+      }
+      cat("  Pathway curve plots written:", length(pathway_curve_files), "/",
+          N_PATHWAY_CURVES, "\n")
+      tpod_summary$pathway_curve_files <- pathway_curve_files
 
       write_json(tpod_summary, file.path(opt$outdir, "tpod_summary.json"),
                  pretty = TRUE, auto_unbox = TRUE)

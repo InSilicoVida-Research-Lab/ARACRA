@@ -65,6 +65,33 @@ RECOMMENDED_ALIGNER = _env("RECOMMENDED_ALIGNER", "star")
 SETUP_DONE       = ENV_FILE.exists() and bool(ENV_BIN)
 
 
+# ── Reference availability ───────────────────────────────────────────────────
+# A module whose reference file is missing must never be offered as an enabled
+# option: Nextflow will launch, the process will exit non-zero, and the whole
+# run dies minutes in. These helpers check the LIVE sidebar path, so they stay
+# correct when the user edits a path by hand.
+
+def _file_ok(path) -> bool:
+    """True if path is a non-empty regular file."""
+    try:
+        p = Path(path)
+        return p.is_file() and p.stat().st_size > 0
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _force_off(widget_key: str):
+    """
+    Force a checkbox off before it renders.
+
+    Streamlit ignores the `value=` argument once a widget key exists in
+    session_state, so changing a default alone does not turn off a box the
+    user already ticked in this session. The key itself must be overwritten.
+    """
+    if st.session_state.get(widget_key):
+        st.session_state[widget_key] = False
+
+
 def _get_ram_gb() -> float:
     try:
         text = open("/proc/meminfo").read()
@@ -161,7 +188,7 @@ def _is_running() -> bool:
             return "nextflow" in cmd.lower() or ("java" in cmd.lower() and "nextflow" in cmd.lower())
         except FileNotFoundError:
             # /proc not available (non-Linux): be conservative, check start time
-            start = state.get("start_time")
+            start = _load_state().get("start_time")
             if start:
                 try:
                     elapsed = (datetime.now() - datetime.fromisoformat(start)).total_seconds()
@@ -293,19 +320,52 @@ TOOLS = {
 }
 
 
+@st.cache_data(ttl=600)
+def _min_versions() -> dict:
+    """Minimum versions, read from lib/aracra_common.sh so the GUI and the
+    installer cannot drift apart. Missing file just disables the check."""
+    try:
+        txt = (PIPELINE_DIR / "lib" / "aracra_common.sh").read_text()
+        line = next(l for l in txt.splitlines()
+                    if l.startswith("ARACRA_MIN_VERSIONS="))
+        body = line.split("=", 1)[1].strip().strip('"')
+        return dict(kv.split("=", 1) for kv in body.split() if "=" in kv)
+    except Exception:
+        return {}
+
+
+def _version_tuple(text: str):
+    """First dotted number in a --version banner, as a comparable tuple."""
+    m = re.search(r"(\d+(?:\.\d+)+)", text or "")
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
 @st.cache_data(ttl=60)
 def check_tools() -> dict:
     result = {}
     env = _process_env()
+    mins = _min_versions()
     for name, cmd in TOOLS.items():
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env)
-            ver = (r.stdout + r.stderr).strip().split("\n")[0][:60]
-            result[name] = {"ok": True, "ver": ver or "OK"}
+            raw = (r.stdout + r.stderr).strip()
+            ver = raw.split("\n")[0][:60]
+            entry = {"ok": True, "ver": ver or "OK", "old": False}
+
+            want = mins.get(name.lower())
+            if want:
+                got = _version_tuple(raw)
+                need = tuple(int(x) for x in want.split("."))
+                # Compare only as far as the minimum specifies, so "1.17"
+                # accepts 1.17.3 without claiming 1.17 < 1.17.0.
+                if got and got[:len(need)] < need:
+                    entry["old"] = True
+                    entry["ver"] = f"{ver}  (expected >= {want})"
+            result[name] = entry
         except FileNotFoundError:
-            result[name] = {"ok": False, "ver": "NOT FOUND"}
+            result[name] = {"ok": False, "ver": "NOT FOUND", "old": False}
         except Exception as e:
-            result[name] = {"ok": False, "ver": str(e)[:60]}
+            result[name] = {"ok": False, "ver": str(e)[:60], "old": False}
     return result
 
 
@@ -328,6 +388,51 @@ if (length(miss)) cat("MISSING:", paste(miss, collapse=",")) else cat("OK")
         return True, []
     except Exception as e:
         return False, [str(e)]
+
+
+# Pathway-enrichment databases offered in the GUI, and the R package each
+# needs beyond clusterProfiler (which all of them need). GO_* and KEGG only
+# need clusterProfiler itself (+ org.Hs.eg.db / KEGGREST, already required).
+ENRICHMENT_DBS = {
+    "GO_BP":     ("GO — Biological Process", None),
+    "GO_MF":     ("GO — Molecular Function", None),
+    "GO_CC":     ("GO — Cellular Component", None),
+    "KEGG":      ("KEGG pathways", None),
+    "REACTOME":  ("Reactome pathways", "ReactomePA"),
+    "MSIGDB_H":  ("MSigDB Hallmark", "msigdbr"),
+    "MSIGDB_C2": ("MSigDB C2 (curated)", "msigdbr"),
+}
+ENRICHMENT_DEFAULT_ON = {"GO_BP", "KEGG", "REACTOME", "MSIGDB_H"}
+
+
+@st.cache_data(ttl=300)
+def check_enrichment_packages() -> dict:
+    """
+    Availability of the R packages the pathway-enrichment feature needs,
+    beyond what check_r_packages() already covers (org.Hs.eg.db, KEGGREST).
+    Opt-in (like check_r_packages/check_tools) rather than run on every
+    rerun — it's an Rscript subprocess, not a free filesystem check.
+    """
+    script = """
+pkgs <- c("clusterProfiler", "ReactomePA", "msigdbr")
+avail <- sapply(pkgs, requireNamespace, quietly = TRUE)
+cat(paste(names(avail), avail, sep = "=", collapse = ","))
+"""
+    result = {"clusterProfiler": False, "ReactomePA": False, "msigdbr": False}
+    try:
+        r = subprocess.run(
+            ["Rscript", "-e", script],
+            capture_output=True, text=True, timeout=30, env=_process_env(),
+        )
+        out = (r.stdout + r.stderr).strip()
+        for pair in out.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                if k in result:
+                    result[k] = (v.strip() == "TRUE")
+    except Exception:
+        pass
+    return result
 
 
 def get_sysinfo() -> dict:
@@ -630,7 +735,7 @@ def _show_qc_review(flags: dict, all_samples: list[str], key_prefix: str = "full
         # ── Display PCA scatter plot if available ──
         # Search comprehensively — the plot could be in qc_results, deg_results, or dromics_results
         _pca_plot_found = False
-        _run_name = run_name or state.get("run_name", "")
+        _run_name = run_name or _load_state().get("run_name", "")
         _pca_search_paths = [
             # QC-only run output
             Path(outdir) / "runs" / _run_name / "qc_results" / "pca_qc_plot.png",
@@ -780,6 +885,68 @@ def display_results(run_dir: Path):
 
     st.divider()
 
+    # --- Pathway Enrichment (ORA) ---
+    st.markdown("#### Pathway Enrichment")
+    enrich_dir = deg_dir / "enrichment"
+    enrich_summary_path = enrich_dir / "enrichment_summary.json"
+    if enrich_summary_path.exists():
+        es = json.loads(enrich_summary_path.read_text())
+        if es.get("status") == "skipped":
+            _reason = {
+                "no_degs": "No DEG file was produced by DESeq2.",
+                "zero_degs": "Zero significant DEGs at the configured FDR/log2FC threshold — nothing to test for enrichment.",
+                "clusterProfiler_missing": "The clusterProfiler R package is not installed. Re-run setup.sh, or install it "
+                                            "manually with BiocManager::install(\"clusterProfiler\").",
+            }.get(es.get("reason"), es.get("reason", "Unknown reason."))
+            st.info(f"ℹ Pathway enrichment skipped — {_reason}")
+        else:
+            st.caption(
+                f"{_jv(es, 'n_degs')} DEGs tested "
+                f"({_jv(es, 'n_degs_entrez')} Entrez-mapped) against a background of "
+                f"{_jv(es, 'n_background')} genes · "
+                f"padj < {_jv(es, 'padj_cutoff')} · qvalue < {_jv(es, 'qvalue_cutoff')}"
+            )
+            results = es.get("results") or {}
+            if not results:
+                st.info("ℹ No databases were run.")
+            for tag, r in results.items():
+                label = r.get("label", tag)
+                if not r.get("ran"):
+                    _why = {
+                        "package_missing": "required R package not installed",
+                        "no_entrez_ids": "no DEGs could be mapped to Entrez IDs",
+                        "load_failed": "gene sets failed to load",
+                    }.get(r.get("reason"), r.get("reason", "not run"))
+                    st.caption(f"⚠ **{label}**: skipped — {_why}")
+                    continue
+                n_terms = r.get("n_terms", 0)
+                with st.expander(f"{label} — {n_terms} significant term{'s' if n_terms != 1 else ''}",
+                                  expanded=(n_terms > 0)):
+                    if n_terms == 0:
+                        st.caption("No significantly enriched terms at the configured cutoffs.")
+                        continue
+                    dot_img = enrich_dir / f"enrichment_{tag}_dotplot.png"
+                    bar_img = enrich_dir / f"enrichment_{tag}_barplot.png"
+                    if dot_img.exists() or bar_img.exists():
+                        ec1, ec2 = st.columns(2)
+                        if dot_img.exists():
+                            ec1.image(str(dot_img), use_container_width=True)
+                        if bar_img.exists():
+                            ec2.image(str(bar_img), use_container_width=True)
+                    csv_path = enrich_dir / f"enrichment_{tag}.csv"
+                    if csv_path.exists():
+                        st.dataframe(pd.read_csv(csv_path).head(30), use_container_width=True, hide_index=True)
+                        st.download_button(
+                            f"⬇ {label} results (CSV)",
+                            csv_path.read_bytes(), file_name=csv_path.name, mime="text/csv",
+                            key=f"dl_{run_dir.name}_{tag}",
+                        )
+    else:
+        st.info("No pathway enrichment results in this run "
+                "(enable it in the sidebar before running DESeq2).")
+
+    st.divider()
+
     # --- DRomics ---
     st.markdown("#### DRomics / BMD")
     dp = dr_dir / "dromics_summary.json"
@@ -898,9 +1065,12 @@ def display_results(run_dir: Path):
                     rows = []
                     for key, m in tpod_methods.items():
                         if isinstance(m, dict):
+                            _val = m.get("value")
                             rows.append({
                                 "Method":       m.get("label", key),
-                                "tPOD (µM)":    round(float(m.get("value", 0)), 6),
+                                # None when no gene set qualified (e.g. nothing
+                                # cleared the coverage-gated method's threshold)
+                                "tPOD (µM)":    round(float(_val), 6) if _val is not None else None,
                                 "Reference":    m.get("ref", ""),
                                 "Genes Used":   m.get("n_genes_used", ""),
                                 "Pathway":      m.get("pathway_name", ""),
@@ -951,6 +1121,34 @@ def display_results(run_dir: Path):
                             })
                     if t5rows:
                         st.dataframe(pd.DataFrame(t5rows), use_container_width=True, hide_index=True)
+
+            # ── Per-pathway dose-response curves ─────────────────────────────────
+            # Each gene's already-fitted curve overlaid, for the top sensitive
+            # pathways — makes coverage/evidence-strength visible at a glance:
+            # a pathway with few, noisy member curves looks visibly thinner than
+            # one with many genes agreeing tightly, even when both cleared the
+            # same NTP filter and either could technically "win" the headline
+            # tPOD (NTP 2018's method doesn't distinguish between them either).
+            curve_files = tpod.get("pathway_curve_files") or []
+            if curve_files:
+                with st.expander(
+                    f"\U0001f4c8 Dose-Response Curves — Top {len(curve_files)} Sensitive Pathways",
+                    expanded=True,
+                ):
+                    st.caption(
+                        "Grey lines: each member gene's own fitted curve. Dots: each "
+                        "gene's own BMD. Dashed line: the pathway's reported median BMD. "
+                        "A pathway with only a handful of thin, sparse curves is weaker "
+                        "evidence than one with many genes agreeing — even if its "
+                        "number is lower."
+                    )
+                    cc = st.columns(2)
+                    for i, cf in enumerate(curve_files):
+                        if not isinstance(cf, dict):
+                            continue
+                        fp = dr_dir / cf.get("file", "")
+                        if fp.exists():
+                            cc[i % 2].image(str(fp), use_container_width=True)
 
         # ── Plots row 1: dose-response + BMD distribution ─────────────────────
         c1, c2 = st.columns(2)
@@ -1041,6 +1239,7 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif;-webkit-font-smoothing
 .s-review{font-family:'JetBrains Mono',monospace;color:#b388ff;font-size:.95rem;font-weight:600}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
 /* ── Tool check ── */
+.tok-warn{color:#ffb020;font-family:'JetBrains Mono',monospace;font-size:.75rem;display:block;padding:1px 0}
 .tok-ok{color:#00d4aa;font-family:'JetBrains Mono',monospace;font-size:.75rem;display:block;padding:1px 0}
 .tok-err{color:#ff6b6b;font-family:'JetBrains Mono',monospace;font-size:.75rem;display:block;padding:1px 0}
 /* ── Info/warn boxes ── */
@@ -1097,8 +1296,23 @@ _defaults = {
     "bmdu_bmdl_ratio":  40.0,
     "bmd_max_dose_filter": True,
     "bmd_extrap_factor": 10.0,
+    "bmd_extrap_filter": False,
+    "pathway_min_coverage": 20.0,
     "fold_change_min":  0.0,
     "use_msigdb":       True,
+    # Pathway enrichment (ORA). Pre-registered here — not just set by their
+    # own widgets in tab_params — because _build_params() (called from
+    # tab_full/tab_analysis, which render *before* tab_params in script
+    # order) reads them on every run, including the very first one.
+    "enrich_go_bp":     True,
+    "enrich_go_mf":     False,
+    "enrich_go_cc":     False,
+    "enrich_kegg":      True,
+    "enrich_reactome":  True,
+    "enrich_msigdb_h":  True,
+    "enrich_msigdb_c2": False,
+    "enrich_padj":      0.05,
+    "enrich_qvalue":    0.2,
     "count_matrix_path": None,
     "count_matrix_df":  None,
     "exclude_samples":  [],
@@ -1215,6 +1429,23 @@ with st.sidebar:
     refflat      = st.text_input("refFlat",          value=REFFLAT_PATH,     key="refflat_in")
     screen_conf  = st.text_input("FastQ Screen conf", value=SCREEN_CONF_PATH, key="screen_in")
 
+    # Show which optional references are actually present, so a missing file is
+    # visible here rather than discovered when a pipeline process crashes.
+    _ref_status = [
+        ("RefSeq BED",       _file_ok(bed)),
+        ("Housekeeping BED", _file_ok(hk_bed)),
+        ("refFlat",          _file_ok(refflat)),
+        ("FastQ Screen",     _file_ok(screen_conf)),
+    ]
+    _missing_refs = [n for n, okv in _ref_status if not okv]
+    if _missing_refs:
+        st.markdown(
+            f'<div class="box-warn">\u26a0 Missing: {", ".join(_missing_refs)}'
+            f'<br><span style="font-size:.7rem">Related modules are disabled. '
+            f'Re-run setup.sh to fetch them.</span></div>',
+            unsafe_allow_html=True,
+        )
+
     st.markdown('<p class="sec">\U0001f4c1 Directories</p>', unsafe_allow_html=True)
     outdir  = st.text_input("Output directory", value=DEFAULT_OUT,  key="out_in")
     workdir = st.text_input("Work directory",   value=DEFAULT_WORK, key="wk_in")
@@ -1249,6 +1480,14 @@ with st.sidebar:
     st.markdown('<p class="sec">\U0001f52c Downstream</p>', unsafe_allow_html=True)
     run_deg     = st.checkbox("DESeq2", value=True)
     run_dromics = st.checkbox("DRomics / BMD",    value=True)
+    run_enrichment = st.checkbox(
+        "Pathway Enrichment (GO/KEGG/Reactome/MSigDB)",
+        value=False, key="run_enrichment",
+        help="Over-representation analysis (ORA) on significant DESeq2 DEGs "
+             "against GO, KEGG, Reactome and MSigDB. Runs only when DESeq2 "
+             "is also enabled — configure databases and thresholds in "
+             "the Parameters tab.",
+    )
 
     st.markdown('<p class="sec">\U0001f527 System Check</p>', unsafe_allow_html=True)
     if st.button("\u25b6 Check Tools", use_container_width=True):
@@ -1256,11 +1495,20 @@ with st.sidebar:
         st.session_state.tools = check_tools()
     if st.session_state.tools:
         for name, info in st.session_state.tools.items():
-            cls  = "tok-ok" if info["ok"] else "tok-err"
-            icon = "\u2714" if info["ok"] else "\u2718"
+            if not info["ok"]:
+                cls, icon = "tok-err", "\u2718"
+            elif info.get("old"):
+                cls, icon = "tok-warn", "\u26a0"
+            else:
+                cls, icon = "tok-ok", "\u2714"
             st.markdown(
-                f'<span class="{cls}">{icon} {name}: {info["ver"][:40]}</span>',
+                f'<span class="{cls}">{icon} {name}: {info["ver"][:48]}</span>',
                 unsafe_allow_html=True,
+            )
+        if any(i.get("old") for i in st.session_state.tools.values()):
+            st.caption(
+                "\u26a0 Older than expected \u2014 usually fine, but worth noting if "
+                "results look wrong. Re-run `bash setup.sh` to update."
             )
         r_ok, r_miss = check_r_packages()
         if r_ok:
@@ -1318,7 +1566,14 @@ def _build_params(
     platform_temposeq: bool = False,
     temposeq_manifest_path: str = None,
 ) -> dict:
-    """Build params dict for Nextflow -params-file."""
+    """
+    Build params dict for Nextflow -params-file.
+
+    Every optional module is gated on its reference file existing on disk.
+    This is the last line of defence: even if a checkbox is stale or wrong,
+    no module is enabled without the file it needs, so a missing reference
+    degrades to a skipped step instead of killing the run mid-flight.
+    """
     is_phase1 = (phase == "preprocess")
     is_phase2 = (phase == "analysis")
 
@@ -1343,15 +1598,15 @@ def _build_params(
         # Phase 1: preprocess only
         "run_download":       (fastq_source == "Download from SRA") and not is_phase2,
         "run_fastp":          (fastq_source != "Local FASTQs (already trimmed)") and not is_phase2,
-        "run_fastq_screen":   run_screen and not is_phase2,
+        "run_fastq_screen":   run_screen and _file_ok(screen_conf) and not is_phase2,
         "run_star":           (aligner.lower() == "star") and not is_phase2,
         "run_hisat2":         (aligner.lower() == "hisat2") and not is_phase2,
         "run_samtools_stats": (not no_aligner) and not is_phase2,
-        "run_strandedness":   use_strand and not is_phase2 and not platform_temposeq,
-        "run_coverage_hk":    use_cov_hk and not is_phase2 and not platform_temposeq,
-        "run_coverage_full":  use_cov_full and not is_phase2 and not platform_temposeq,
-        "run_read_distribution": run_read_dist and (not no_aligner) and not is_phase2 and not platform_temposeq,
-        "run_picard":         use_picard and not is_phase2 and not platform_temposeq,
+        "run_strandedness":   use_strand and _file_ok(bed) and not is_phase2 and not platform_temposeq,
+        "run_coverage_hk":    use_cov_hk and _file_ok(hk_bed) and not is_phase2 and not platform_temposeq,
+        "run_coverage_full":  use_cov_full and _file_ok(bed) and not is_phase2 and not platform_temposeq,
+        "run_read_distribution": run_read_dist and (not no_aligner) and _file_ok(bed) and not is_phase2 and not platform_temposeq,
+        "run_picard":         use_picard and _file_ok(refflat) and not is_phase2 and not platform_temposeq,
         "run_qualimap":       run_qualimap and (not no_aligner) and not is_phase2 and not platform_temposeq,
         "run_featurecounts":  use_fc and not is_phase2 and not platform_temposeq,
         "run_salmon":         use_salmon and not is_phase2 and not platform_temposeq,
@@ -1361,6 +1616,15 @@ def _build_params(
         # Phase 2: analysis only (disabled during Phase 1)
         "run_deg":            run_deg and not is_phase1,
         "run_dromics":        run_dromics and not is_phase1,
+        # Enrichment needs DESeq2's DEG output, so it's additionally gated on
+        # run_deg here — the "last line of defence" pattern used throughout
+        # this function, same as the reference-file gates above.
+        "run_enrichment":     run_enrichment and run_deg and not is_phase1,
+        "enrich_databases":   ",".join(
+            db for db in ENRICHMENT_DBS if st.session_state.get(f"enrich_{db.lower()}")
+        ),
+        "enrich_padj":        st.session_state.enrich_padj,
+        "enrich_qvalue":      st.session_state.enrich_qvalue,
         "fdr_strict":         st.session_state.fdr_strict,
         "fdr_relaxed":        st.session_state.fdr_relaxed,
         "log2fc_threshold":   st.session_state.log2fc,
@@ -1377,6 +1641,8 @@ def _build_params(
         "bmdu_bmdl_ratio":    st.session_state.bmdu_bmdl_ratio,
         "bmd_max_dose_filter": st.session_state.bmd_max_dose_filter,
         "bmd_extrap_factor":  st.session_state.bmd_extrap_factor,
+        "bmd_extrap_filter":  st.session_state.bmd_extrap_filter,
+        "pathway_min_coverage": st.session_state.pathway_min_coverage,
         "fold_change_min":    st.session_state.fold_change_min,
         "exclude_samples":    ",".join(exclude_samples or []),
         # TempO-Seq platform
@@ -1571,6 +1837,8 @@ def _validate_full(
     run_read_dist, treatment, control,
     fastq_source, fastq_dir_val, trimmed_dir_val,
     is_temposeq=False, temposeq_manifest_path=None,
+    run_screen=False,
+    wants_strand=False, wants_cov_hk=False, wants_cov_full=False, wants_picard=False,
 ) -> tuple[list, list]:
     """Return (issues, warnings) for the full pipeline."""
     issues, warnings = [], []
@@ -1594,25 +1862,47 @@ def _validate_full(
         if not temposeq_manifest_path or not Path(temposeq_manifest_path).exists():
             issues.append("TempO-Seq mode requires a BioSpyder manifest CSV \u2014 upload in sidebar")
     else:
-        if not Path(gtf).exists():
+        if not _file_ok(gtf):
             issues.append(f"GTF not found: {gtf}")
         if not pseudo_only or qc_needs_bam:
-            if aligner == "STAR" and not Path(star_index).is_dir():
-                issues.append(f"STAR index not found: {star_index}")
-            if aligner == "HISAT2" and not Path(hisat2_index + ".1.ht2").exists():
+            # Content check, not a directory check: an interrupted STAR build
+            # leaves a directory behind that a bare is_dir() would accept.
+            if aligner == "STAR" and not _file_ok(Path(star_index) / "SA"):
+                issues.append(f"STAR index missing or incomplete: {star_index}")
+            if aligner == "HISAT2" and not _file_ok(hisat2_index + ".1.ht2"):
                 issues.append(f"HISAT2 index not found: {hisat2_index}")
             if aligner == "STAR" and 0 < SYSTEM_RAM_GB < 32:
                 issues.append(f"STAR needs \u226532 GB RAM (you have {SYSTEM_RAM_GB:.0f} GB)")
-    if use_salmon and not Path(salmon_index).is_dir():
-        issues.append(f"Salmon index not found: {salmon_index}")
-    if use_pseudo and not Path(salmon_index).is_dir():
-        issues.append(f"Salmon index not found (pseudomapping): {salmon_index}")
+    if use_salmon and not _file_ok(Path(salmon_index) / "info.json"):
+        issues.append(f"Salmon index missing or incomplete: {salmon_index}")
+    if use_pseudo and not _file_ok(Path(salmon_index) / "info.json"):
+        issues.append(f"Salmon index missing or incomplete (pseudomapping): {salmon_index}")
     if treatment and control and treatment == control:
         issues.append("Treatment = Control")
     if fastq_source == "Local FASTQs (raw)" and fastq_dir_val and not Path(fastq_dir_val).is_dir():
         issues.append(f"FASTQ dir not found: {fastq_dir_val}")
     if fastq_source == "Local FASTQs (already trimmed)" and trimmed_dir_val and not Path(trimmed_dir_val).is_dir():
         issues.append(f"Trimmed FASTQ dir not found: {trimmed_dir_val}")
+
+    # Optional-module references: absent means the module is skipped, not that
+    # the run is invalid — so these are warnings, not issues.
+    #
+    # run_screen/run_read_dist are checkboxes that are force-disabled the
+    # moment their reference file goes missing (see tab_full), so by the time
+    # they reach here they can never be True with a missing file — checking
+    # them again would be dead code. rna_metrics/coverage_mode are radios
+    # (Streamlit can't disable a single option), so a selection can still
+    # name an unavailable module; wants_* (the raw selection, before the
+    # file-availability gate) is what lets that case be detected here.
+    if not is_temposeq:
+        if wants_strand and not use_strand:
+            warnings.append(f"RefSeq BED not found \u2014 strandedness skipped: {bed}")
+        if wants_cov_hk and not use_cov_hk:
+            warnings.append(f"Housekeeping BED not found \u2014 coverage skipped: {hk_bed}")
+        if wants_cov_full and not use_cov_full:
+            warnings.append(f"RefSeq BED not found \u2014 full coverage skipped: {bed}")
+        if wants_picard and not use_picard:
+            warnings.append(f"refFlat not found \u2014 Picard RNA metrics skipped: {refflat}")
 
     if no_aligner:
         warnings.append("\u26a1 No-alignment mode \u2014 post-alignment QC disabled.")
@@ -1748,6 +2038,17 @@ with tab_full:
                 ["Housekeeping genes", "Full genome", "Both", "None"],
                 horizontal=True, key="coverage_mode",
             )
+            # st.radio can't disable individual options, so — unlike the
+            # checkboxes below — a selection here can still name an
+            # unavailable module. Surface that immediately, at the point of
+            # selection, the same way the checkboxes do.
+            _cov_missing = []
+            if coverage_mode in ("Housekeeping genes", "Both") and not _file_ok(hk_bed):
+                _cov_missing.append("housekeeping BED")
+            if coverage_mode in ("Full genome", "Both") and not _file_ok(bed):
+                _cov_missing.append("RefSeq BED")
+            if _cov_missing:
+                st.caption(f"⚠ {', '.join(_cov_missing)} missing — coverage will be skipped")
 
         tc3, tc4 = st.columns(2)
         with tc3:
@@ -1756,9 +2057,43 @@ with tab_full:
                 ["RSeQC (strandedness)", "Picard", "Both", "None"],
                 horizontal=True, key="rna_metrics",
             )
+            _rna_missing = []
+            if rna_metrics in ("RSeQC (strandedness)", "Both") and not _file_ok(bed):
+                _rna_missing.append("RefSeq BED")
+            if rna_metrics in ("Picard", "Both") and not _file_ok(refflat):
+                _rna_missing.append("refFlat")
+            if _rna_missing:
+                st.caption(f"⚠ {', '.join(_rna_missing)} missing — that metric will be skipped")
         with tc4:
-            run_screen    = st.checkbox("FastQ Screen", value=True, key="run_screen")
-            run_read_dist = st.checkbox("Read distribution", value=False, key="run_read_dist")
+            # A module with no reference file must not be offered as enabled.
+            # _force_off is required because Streamlit ignores `value=` once a
+            # widget key already exists in session_state.
+            _screen_ok = _file_ok(screen_conf)
+            if not _screen_ok:
+                _force_off("run_screen")
+            run_screen = st.checkbox(
+                "FastQ Screen",
+                value=_screen_ok,
+                disabled=not _screen_ok,
+                key="run_screen",
+                help=None if _screen_ok else
+                     "Genome config not found. Re-run setup.sh to download "
+                     "the FastQ Screen genomes.",
+            ) and _screen_ok
+            if not _screen_ok:
+                st.caption("\u26a0 conf missing \u2014 module unavailable")
+
+            _bed_ok = _file_ok(bed)
+            if not _bed_ok:
+                _force_off("run_read_dist")
+            run_read_dist = st.checkbox(
+                "Read distribution",
+                value=False,
+                disabled=not _bed_ok,
+                key="run_read_dist",
+                help=None if _bed_ok else "RefSeq BED not found. Re-run setup.sh.",
+            ) and _bed_ok
+
             run_qualimap  = st.checkbox("Qualimap", value=False, key="run_qualimap")
 
         # ── Comparison ──
@@ -1780,14 +2115,23 @@ with tab_full:
         run_name_full = st.text_input("Run name", value=_make_run_name(treatment, control), key="run_name_full")
 
     # ── Derived flags ──
+    # Each optional module is additionally gated on its reference file, so a
+    # missing file disables the module everywhere rather than only in the params.
     no_aligner   = aligner == "None (pseudo only)"
     use_fc       = quant_tool in ("featureCounts", "Both (fC + pseudo)") and not no_aligner
     use_salmon   = quant_tool == "Salmon (aligned)" and not no_aligner
     use_pseudo   = quant_tool in ("Salmon pseudomap", "Both (fC + pseudo)") or no_aligner
-    use_cov_hk   = coverage_mode in ("Housekeeping genes", "Both") and not no_aligner
-    use_cov_full = coverage_mode in ("Full genome", "Both") and not no_aligner
-    use_strand   = rna_metrics in ("RSeQC (strandedness)", "Both") and not no_aligner
-    use_picard   = rna_metrics in ("Picard", "Both") and not no_aligner
+    # "wants_*": the raw selection, independent of reference-file availability.
+    # Kept separate from use_* so _validate_full can tell "selected but
+    # unavailable" (worth a warning) apart from "never selected" (nothing to say).
+    wants_cov_hk   = coverage_mode in ("Housekeeping genes", "Both") and not no_aligner
+    wants_cov_full = coverage_mode in ("Full genome", "Both") and not no_aligner
+    wants_strand   = rna_metrics in ("RSeQC (strandedness)", "Both") and not no_aligner
+    wants_picard   = rna_metrics in ("Picard", "Both") and not no_aligner
+    use_cov_hk   = wants_cov_hk and _file_ok(hk_bed)
+    use_cov_full = wants_cov_full and _file_ok(bed)
+    use_strand   = wants_strand and _file_ok(bed)
+    use_picard   = wants_picard and _file_ok(refflat)
     pseudo_only  = no_aligner or (quant_tool == "Salmon pseudomap" and not use_fc and not use_salmon)
 
     with R:
@@ -1801,6 +2145,9 @@ with tab_full:
             use_strand, use_picard, run_qualimap, use_cov_hk, use_cov_full,
             run_read_dist, treatment, control, fastq_source, fastq_dir_val, trimmed_dir_val,
             is_temposeq=is_temposeq, temposeq_manifest_path=temposeq_manifest_path,
+            run_screen=run_screen,
+            wants_strand=wants_strand, wants_cov_hk=wants_cov_hk,
+            wants_cov_full=wants_cov_full, wants_picard=wants_picard,
         )
         if not issues:
             st.markdown('<div class="box-info">\u2714 All checks passed</div>', unsafe_allow_html=True)
@@ -2181,11 +2528,23 @@ with tab_analysis:
 
         # ── Analysis selection — user chooses which to run ──
         st.markdown('<p class="sec">\U0001f527 Analysis Selection</p>', unsafe_allow_html=True)
-        ac1, ac2 = st.columns(2)
+        ac1, ac2, ac3 = st.columns(3)
         with ac1:
             run_deseq2_here = st.checkbox("Run DESeq2", value=run_deg, key="run_deseq2_analysis")
         with ac2:
             run_dromics_here = st.checkbox("Run DRomics / BMD", value=run_dromics, key="run_dromics_analysis")
+        with ac3:
+            # Enrichment runs on DESeq2's DEG output, so it can't be selected
+            # without DESeq2 also being selected — same disable+force-off
+            # pattern used for the reference-gated checkboxes in tab_full.
+            if not run_deseq2_here:
+                _force_off("run_enrichment_analysis")
+            run_enrichment_here = st.checkbox(
+                "Run Pathway Enrichment", value=run_enrichment,
+                disabled=not run_deseq2_here, key="run_enrichment_analysis",
+                help=None if run_deseq2_here else
+                     "Requires DESeq2 — enrichment runs on its DEG output.",
+            ) and run_deseq2_here
 
         st.markdown('<p class="sec">\U0001f3f7 Run Name</p>', unsafe_allow_html=True)
         run_name_analysis = _make_run_name(treatment_a, control_a)
@@ -2491,6 +2850,7 @@ with tab_analysis:
                 params["run_qc_only"] = False
                 params["run_deg"] = True
                 params["run_dromics"] = False
+                params["run_enrichment"] = run_enrichment_here
                 _launch_with_params(params, run_name_analysis, mode="direct", phase="analysis")
                 st.session_state._qc_valid = False  # reset after launching analysis
                 st.success(
@@ -2518,6 +2878,7 @@ with tab_analysis:
                 params["run_qc_only"] = False
                 params["run_deg"] = False
                 params["run_dromics"] = True
+                params["run_enrichment"] = False  # no DESeq2 output to enrich
                 _launch_with_params(params, run_name_analysis + "_dromics", mode="direct", phase="analysis")
                 st.session_state._qc_valid = False
                 st.success(
@@ -2545,6 +2906,7 @@ with tab_analysis:
                 params["run_qc_only"] = False
                 params["run_deg"] = run_deseq2_here
                 params["run_dromics"] = run_dromics_here
+                params["run_enrichment"] = run_enrichment_here
                 _launch_with_params(params, run_name_analysis, mode="direct", phase="analysis")
                 st.session_state._qc_valid = False
                 st.success(
@@ -2558,6 +2920,8 @@ with tab_analysis:
             st.caption("\u2139 DESeq2 disabled \u2014 enable it in the Analysis Selection above.")
         if not run_dromics_here:
             st.caption("\u2139 DRomics disabled \u2014 enable it in the Analysis Selection above.")
+        if run_deseq2_here and not run_enrichment_here:
+            st.caption("\u2139 Pathway enrichment disabled \u2014 enable it in the Analysis Selection above.")
 
     # ── Step 4: Inline Results — show analysis results right here ──────────
     # Detect completed analysis run for the current comparison and show results
@@ -2574,6 +2938,8 @@ with tab_analysis:
         _dromics_results_dir = _dromics_run_dir
     else:
         _dromics_results_dir = _analysis_run_dir
+
+    _analysis_has_results = _analysis_has_deg or _analysis_has_dromics
 
     if _analysis_has_results and not running:
         st.markdown("---")
@@ -2743,6 +3109,58 @@ with tab_params:
         st.slider("Min proportion expressed", 0.0, 1.0, 0.75, 0.05, key="min_prop")
 
     st.divider()
+    st.markdown("#### Pathway Enrichment (ORA)")
+    st.caption(
+        "Over-representation analysis on significant DESeq2 DEGs "
+        "(gene list) against every gene DESeq2 tested (background universe). "
+        "Enable **Pathway Enrichment** in the sidebar to run it."
+    )
+    if st.button("\U0001f527 Check Enrichment Packages", key="check_enrich_pkgs"):
+        st.session_state["_enrich_pkg_status"] = check_enrichment_packages()
+    _pkg_status = st.session_state.get("_enrich_pkg_status")
+
+    e1, e2 = st.columns(2)
+    with e1:
+        st.markdown("**Databases**")
+        for _db, (_label, _needs_pkg) in ENRICHMENT_DBS.items():
+            _extra_pkg_missing = bool(
+                _needs_pkg and _pkg_status and not _pkg_status.get(_needs_pkg, True)
+            )
+            st.checkbox(
+                _label,
+                value=(_db in ENRICHMENT_DEFAULT_ON),
+                key=f"enrich_{_db.lower()}",
+                help=(f"Needs the '{_needs_pkg}' R package — not detected. "
+                      f"Re-run setup.sh, or install it and click "
+                      f"'Check Enrichment Packages' above.")
+                     if _extra_pkg_missing else None,
+            )
+        if _pkg_status is not None and not _pkg_status.get("clusterProfiler"):
+            st.markdown(
+                '<div class="box-warn">⚠ clusterProfiler not installed — '
+                'no database can run. Re-run setup.sh.</div>',
+                unsafe_allow_html=True,
+            )
+    with e2:
+        st.number_input(
+            "Adjusted p-value cutoff", min_value=0.001, max_value=0.5, step=0.01,
+            help="BH-adjusted p-value threshold for a term to be reported significant.",
+            key="enrich_padj",
+        )
+        st.number_input(
+            "Q-value cutoff", min_value=0.01, max_value=1.0, step=0.05,
+            help="Additional FDR q-value threshold (clusterProfiler default: 0.2).",
+            key="enrich_qvalue",
+        )
+        st.caption(
+            "GO — Ashburner et al. 2000, *Nat Genet* · "
+            "KEGG — Kanehisa & Goto 2000, *NAR* · "
+            "Reactome — Fabregat et al. 2018, *NAR* · "
+            "MSigDB — Liberzon et al. 2015, *Cell Syst*. "
+            "KEGG queries the live KEGG REST API (needs internet access at run time)."
+        )
+
+    st.divider()
     st.markdown("#### DRomics / BMD")
     b1, b2, b3, b4 = st.columns(4)
     with b1:
@@ -2798,6 +3216,15 @@ with tab_params:
             help="Flag genes with BMD < lowest_dose / factor as extrapolated.",
             key="bmd_extrap_factor",
         )
+        st.checkbox(
+            "Also remove extrapolated BMDs",
+            help=(
+                "Off (default): extrapolated genes are flagged but kept in the tPOD "
+                "gene set — this reproduces published ARACRA runs. On: they are "
+                "dropped, which raises low-end tPODs (rank25, perc05)."
+            ),
+            key="bmd_extrap_filter",
+        )
     with ntp2:
         st.number_input(
             "Min fold-change",
@@ -2809,6 +3236,20 @@ with tab_params:
             "Include MSigDB Hallmark + C2 gene sets",
             help="Auto-detected: included when msigdbr R package is installed. ~50 Hallmark and ~6,300 C2 curated gene sets.",
             key="use_msigdb",
+        )
+        st.number_input(
+            "Min pathway coverage for credible tPOD (%)",
+            min_value=0.0, max_value=100.0, step=5.0,
+            help=(
+                "NTP 2018's tPOD is the single lowest-median gene set among every "
+                "one tested, with no regard for how much of that gene set was "
+                "actually detected — a 3-gene, 13%-coverage set and a 14-gene, "
+                "88%-coverage set compete on equal footing. This adds a SECOND, "
+                "stricter tPOD (\"pathway_credible\" in the methods table) that "
+                "only considers gene sets at or above this coverage — the NTP "
+                "2018 headline number is unchanged either way."
+            ),
+            key="pathway_min_coverage",
         )
 
     st.divider()

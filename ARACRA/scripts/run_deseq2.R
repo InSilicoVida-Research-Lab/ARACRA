@@ -103,7 +103,7 @@ if (has_batch && batch_corrected_pca) {
   pca_title <- "PCA \u2014 VST counts"
 }
 
-pca2     <- prcomp(t(assay(vst(
+pca2     <- prcomp(t(assay(safe_vst(
   DESeqDataSetFromMatrix(pca_counts_for_plot, final_meta, ~1), blind = TRUE))))
 pca_df           <- as.data.frame(pca2$x)
 pca_df$condition <- final_meta$condition
